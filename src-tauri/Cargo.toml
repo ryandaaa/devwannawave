@@ -1,0 +1,26 @@
+[package]
+name = "devwannawave"
+version = "1.0.0"
+description = "a quiet, local-first audio player for developers"
+authors = ["devwannawave"]
+edition = "2021"
+
+[lib]
+name = "devwannawave_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "devwannawave"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+lofty = "0.24.0"
+rodio = "0.22.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+thiserror = "2"
+walkdir = "2"

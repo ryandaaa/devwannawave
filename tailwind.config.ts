@@ -1,0 +1,97 @@
+import type { Config } from "tailwindcss";
+
+const c = (name: string) => `rgb(var(--c-${name}) / <alpha-value>)`;
+
+export default {
+  content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  theme: {
+    borderRadius: {
+      none: "0",
+      button: "6px",
+      window: "10px",
+      thumb: "4px",
+    },
+    boxShadow: {
+      none: "none",
+    },
+    backgroundImage: {},
+    spacing: {
+      0: "0",
+      px: "1px",
+      xs: "4px",
+      sm: "8px",
+      md: "12px",
+      lg: "16px",
+      xl: "24px",
+      "h-chip": "24px",
+      "h-row": "40px",
+      "h-cta": "40px",
+      "h-bar": "48px",
+      "h-now": "72px",
+      "w-nav": "220px",
+      "w-nav-collapsed": "60px",
+      "w-transport": "260px",
+      "w-meter": "96px",
+      "w-cover": "120px",
+      "h-cover": "120px",
+      "h-search-results": "160px",
+    },
+    colors: {
+      transparent: "transparent",
+      current: "currentColor",
+      inherit: "inherit",
+      background: c("background"),
+      surface: c("surface"),
+      "surface-container-lowest": c("surface-container-lowest"),
+      "surface-container-low": c("surface-container-low"),
+      "surface-container": c("surface-container"),
+      "surface-container-high": c("surface-container-high"),
+      "surface-container-highest": c("surface-container-highest"),
+      "surface-variant": c("surface-variant"),
+      "on-surface": c("on-surface"),
+      "on-surface-variant": c("on-surface-variant"),
+      primary: c("primary"),
+      "on-primary": c("on-primary"),
+      outline: c("outline"),
+      "outline-variant": c("outline-variant"),
+      error: c("error"),
+      "on-error": c("on-error"),
+    },
+    fontFamily: {
+      mono: [
+        '"Geist Mono Variable"',
+        '"Geist Mono"',
+        "ui-monospace",
+        "monospace",
+      ],
+    },
+    fontSize: {
+      "label-caps": [
+        "10px",
+        { lineHeight: "1.2", letterSpacing: "0.05em" },
+      ],
+      "body-sm": [
+        "12px",
+        { lineHeight: "1.55", letterSpacing: "0.01em" },
+      ],
+      code: ["12px", { lineHeight: "1.55", letterSpacing: "0.01em" }],
+      "body-md": [
+        "13px",
+        { lineHeight: "1.55", letterSpacing: "0.01em" },
+      ],
+      headline: ["14px", { lineHeight: "1.2", letterSpacing: "0" }],
+      "icon-12": ["12px", { lineHeight: "1" }],
+      "icon-14": ["14px", { lineHeight: "1" }],
+      "icon-16": ["16px", { lineHeight: "1" }],
+      "icon-18": ["18px", { lineHeight: "1" }],
+      "icon-24": ["24px", { lineHeight: "1" }],
+    },
+    fontWeight: {
+      normal: "400",
+      medium: "500",
+      semibold: "600",
+    },
+    extend: {},
+  },
+  plugins: [],
+} satisfies Config;

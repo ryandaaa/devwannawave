@@ -1,0 +1,53 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# build outputs
+dist/
+dist-ssr/
+build/
+out/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# environment
+.env
+.env.local
+.env.*.local
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+bun-debug.log*
+*.log
+
+# editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# tool state (Claude Code etc)
+.claude/
+
+# local databases / scan artifacts
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+
+# misc
+.cache/
+*.local
