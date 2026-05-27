@@ -15,7 +15,20 @@
 :root {
   /* non-color custom props use the app prefix (--wave-*) */
   --wave-border: rgb(var(--c-surface-container-high));
+
+  /* fallback background before theme class resolves — prevents white flash */
+  background-color: #151518;
 }
+
+html,
+body,
+#root {
+  background-color: rgb(var(--c-background, 21 21 24));
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
 
 /* ---------------------------------------------------------------- *
  * theme-dark (default)                                              *

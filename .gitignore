@@ -51,3 +51,8 @@ Thumbs.db
 # misc
 .cache/
 *.local
+
+# internal devwanna* docs (not for public repo)
+dev-wanna-design-rule.md
+dev-wanna-philosophy.md
+DESIGN_devwannawave.md
