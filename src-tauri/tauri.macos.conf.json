@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "macOS": {
+      "files": {
+        "Contents/MacOS/dww": "scripts/macos/dww"
+      }
+    }
+  }
+}

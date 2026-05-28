@@ -2,13 +2,10 @@ name: Build & Release
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -19,46 +16,50 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS: universal binary (Intel + Apple Silicon)
-          - platform: 'macos-latest'
-            args: '--target universal-apple-darwin'
-            artifact-name: 'devwannawave-macos-universal'
+          # macOS – universal binary (Intel + Apple Silicon) + merge macOS-specific config
+          - platform: macos-latest
+            args: >-
+              --target universal-apple-darwin
+              --config src-tauri/tauri.macos.conf.json
+            artifact-name: devwannawave-macos-universal
 
-          # Linux: AppImage + .deb
-          - platform: 'ubuntu-22.04'
-            args: ''
-            artifact-name: 'devwannawave-linux'
+          # Linux – AppImage + .deb, merge Linux-specific config
+          - platform: ubuntu-22.04
+            args: --config src-tauri/tauri.linux.conf.json
+            artifact-name: devwannawave-linux
 
-          # Windows: NSIS + MSI installer
-          - platform: 'windows-latest'
+          # Windows – NSIS + MSI
+          - platform: windows-latest
             args: ''
-            artifact-name: 'devwannawave-windows'
+            artifact-name: devwannawave-windows
 
     runs-on: ${{ matrix.platform }}
 
     steps:
+      # ── Source ───────────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── Node/Bun ──────────────────────────────────────────────────────────
+      # ── Bun ──────────────────────────────────────────────────────────────────
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      # ── Rust ─────────────────────────────────────────────────────────────
+      # ── Rust ─────────────────────────────────────────────────────────────────
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
+          # macOS needs both targets for the universal binary
           targets: ${{ matrix.platform == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
 
-      - name: Rust cache
+      - name: Rust build cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
 
-      # ── Linux system dependencies ─────────────────────────────────────────
-      - name: Install system dependencies (Linux)
+      # ── Linux system dependencies ─────────────────────────────────────────────
+      - name: Install system dependencies (Linux only)
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
@@ -75,17 +76,19 @@ jobs:
             libasound2-dev \
             pkg-config
 
-      # ── Frontend ─────────────────────────────────────────────────────────
+      # ── Frontend ─────────────────────────────────────────────────────────────
       - name: Install frontend dependencies
         run: bun install
 
-      # ── Build ─────────────────────────────────────────────────────────────
+      # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Only create a GitHub Release when a version tag is pushed
+          # Use bun instead of npm to invoke the Tauri CLI
+          tauriScript: bunx tauri
+          # Create a GitHub Release only when pushing a version tag (v*)
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && 'v__VERSION__' || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && 'devwannawave v__VERSION__' || '' }}
           releaseBody: |
@@ -94,18 +97,21 @@ jobs:
             ### Downloads
             | Platform | File |
             |----------|------|
-            | Windows  | `.msi` or `.exe` (NSIS) |
-            | macOS    | `.dmg` (Universal — Intel + Apple Silicon) |
-            | Linux    | `.AppImage` or `.deb` |
+            | 🪟 Windows | `.msi` (MSI installer) · `.exe` (NSIS installer) |
+            | 🍎 macOS   | `.dmg` (Universal — Intel + Apple Silicon) |
+            | 🐧 Linux   | `.AppImage` (portable) · `.deb` (Debian/Ubuntu) |
 
-            See the assets below to download the installer for your platform.
-          releaseDraft: ${{ startsWith(github.ref, 'refs/tags/v') }}
+            > **Tip:** You can also grab any build (including non-tagged commits)
+            > directly from the **Actions** tab → select a run → **Artifacts** section.
+          # Draft so you can review before publishing; set to false for auto-publish
+          releaseDraft: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
           prerelease: false
           args: ${{ matrix.args }}
 
-      # ── Upload artifacts ──────────────────────────────────────────────────
-      # Artifacts are always uploaded (even on branch/PR builds) so you can
-      # download them directly from the Actions run page without needing a tag.
+      # ── Upload artifacts ──────────────────────────────────────────────────────
+      # Always uploaded (branch pushes, PRs, tags) – downloadable from the
+      # Actions run page without needing a tagged release.
+
       - name: Upload artifacts – Windows
         if: matrix.platform == 'windows-latest'
         uses: actions/upload-artifact@v4
@@ -126,7 +132,6 @@ jobs:
           if-no-files-found: warn
           path: |
             src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
 
       - name: Upload artifacts – Linux
         if: matrix.platform == 'ubuntu-22.04'
@@ -138,4 +143,3 @@ jobs:
           path: |
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/rpm/*.rpm

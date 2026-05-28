@@ -11,8 +11,15 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  PhysicalPosition,
+  PhysicalSize,
+  availableMonitors,
+  getCurrentWindow,
+  primaryMonitor,
+} from "@tauri-apps/api/window";
 
 type Track = {
   id: number;
@@ -25,11 +32,18 @@ type Track = {
   createdAt: string;
   lastPlayedAt?: string;
   fileName: string;
+  liked: boolean;
+  playCount: number;
+  genre?: string;
+  year?: number;
+  genreOverride?: string;
+  yearOverride?: number;
+  lastPositionMs?: number;
 };
 
-type TrackSortKey = "title" | "artist" | "album" | "duration";
+type TrackSortKey = "title" | "artist" | "album" | "duration" | "playCount" | "genre" | "year";
 type SortDirection = "asc" | "desc";
-type TrackBrowseMode = "all" | "recent-added" | "recent-played";
+type TrackBrowseMode = "all" | "recent-added" | "recent-played" | "most-played" | "never-played";
 
 type BackendTrack = {
   id: number;
@@ -42,11 +56,19 @@ type BackendTrack = {
   duration_seconds: number | null;
   created_at: string;
   last_played_at: string | null;
+  liked: boolean;
+  play_count: number;
+  genre: string | null;
+  year: number | null;
+  genre_override: string | null;
+  year_override: number | null;
+  last_position_ms: number;
 };
 
 type BackendFolder = {
   id: number;
   path: string;
+  pinned: boolean;
 };
 
 type BackendLibrary = {
@@ -60,11 +82,13 @@ type BackendPlaylist = {
   id: number;
   name: string;
   track_ids: number[];
+  pinned: boolean;
 };
 
 type Folder = {
   id: number;
   path: string;
+  pinned: boolean;
   trackCount: number;
 };
 
@@ -87,6 +111,7 @@ type Playlist = {
   name: string;
   trackCount: number;
   tracks: Track[];
+  pinned: boolean;
 };
 
 type ScanSummary = {
@@ -100,6 +125,10 @@ type ImportSummary = ScanSummary & {
   track_ids: number[];
   imported_paths: string[];
   existing_paths: string[];
+};
+type QueueItem = {
+  id: string;
+  trackId: number;
 };
 
 type DropTarget =
@@ -116,6 +145,8 @@ type TrackMetadataDraft = {
   title: string;
   artist: string;
   album: string;
+  genre: string;
+  year: string;
 };
 
 type PlaybackState = {
@@ -124,9 +155,24 @@ type PlaybackState = {
   is_paused: boolean;
   volume: number;
   elapsed_ms: number;
+  gain: number;
 };
 
-type View = "all-tracks" | "folders" | "albums" | "artists" | "playlists";
+type CliCommandStatus = {
+  installed: boolean;
+  location: string | null;
+  reachable_hint: string | null;
+};
+
+type StoredWindowState = {
+  height: number;
+  isMaximized: boolean;
+  width: number;
+  x: number;
+  y: number;
+};
+
+type View = "all-tracks" | "albums" | "artists" | "playlists" | "liked";
 type PlaybackMode = "normal" | "shuffle" | "repeat" | "repeat-one";
 type AppTheme = "light" | "pink" | "solarized-light" | "dark" | "rose-pine" | "coal";
 
@@ -134,6 +180,8 @@ const THEME_STORAGE_KEY = "devwannawave.theme";
 const QUEUE_STORAGE_KEY = "devwannawave.queue";
 const SIDEBAR_WIDTH_STORAGE_KEY = "devwannawave.sidebar-width";
 const PLAYBACK_MODE_STORAGE_KEY = "devwannawave.playback-mode";
+const WINDOW_STATE_STORAGE_KEY = "devwannawave.window-state";
+const QUICK_SETUP_STORAGE_KEY = "devwannawave.quick-setup.v1";
 
 const THEME_OPTIONS: Array<{
   description: string;
@@ -154,7 +202,17 @@ const THEME_OPTIONS: Array<{
   { description: "neutral grey-black", label: "coal", theme: "coal", tone: "coal" },
 ];
 
-function Icon({ name, size = 18 }: { name: string; size?: 12 | 14 | 16 | 18 | 24 }) {
+function useWindowWidth() {
+  const [width, setWidth] = useState(window.innerWidth);
+  useEffect(() => {
+    const handler = () => setWidth(window.innerWidth);
+    window.addEventListener("resize", handler);
+    return () => window.removeEventListener("resize", handler);
+  }, []);
+  return width;
+}
+
+function Icon({ name, size = 18, className = "" }: { name: string; size?: 12 | 14 | 16 | 18 | 24; className?: string }) {
   const sizeClass = {
     12: "text-icon-12",
     14: "text-icon-14",
@@ -164,7 +222,7 @@ function Icon({ name, size = 18 }: { name: string; size?: 12 | 14 | 16 | 18 | 24
   }[size];
 
   return (
-    <span className={`material-symbols-outlined ${sizeClass}`} aria-hidden="true">
+    <span className={`material-symbols-outlined ${sizeClass} ${className}`} aria-hidden="true">
       {name}
     </span>
   );
@@ -223,6 +281,17 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(() => readStoredSidebarWidth());
   const [folderPath, setFolderPath] = useState("");
+  const [filterFolderId, setFilterFolderId] = useState<number | null>(null);
+  const [volumeGain, setVolumeGain] = useState(1.0);
+  const [scanningFolderId, setScanningFolderId] = useState<number | null>(null);
+  const [scanProgress, setScanProgress] = useState<{
+    scanned: number;
+    added: number;
+    currentFile: string;
+  } | null>(null);
+  const [missingTracks, setMissingTracks] = useState<Track[]>([]);
+  const [hasCheckedHealth, setHasCheckedHealth] = useState(false);
+  const [currentCoverUrl, setCurrentCoverUrl] = useState<string | undefined>(undefined);
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [folders, setFolders] = useState<Folder[]>([]);
@@ -236,10 +305,13 @@ function App() {
   } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [quickSetupOpen, setQuickSetupOpen] = useState(() => !hasCompletedQuickSetup());
   const [view, setView] = useState<View>("all-tracks");
   const [queueOpen, setQueueOpen] = useState(false);
-  const [queuedTrackIds, setQueuedTrackIds] = useState<number[]>(() => readStoredQueue());
+  const [queuedTracks, setQueuedTracks] = useState<QueueItem[]>(() => readStoredQueue());
   const [error, setError] = useState<string | null>(null);
+  const [cliCommandStatus, setCliCommandStatus] = useState<CliCommandStatus | null>(null);
+  const [isInstallingCliCommand, setIsInstallingCliCommand] = useState(false);
   const [scanSummary, setScanSummary] = useState<string | null>(null);
   const [importHint, setImportHint] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
@@ -257,12 +329,14 @@ function App() {
   const [shuffledTrackIds, setShuffledTrackIds] = useState<number[]>([]);
   const autoNextInFlightRef = useRef(false);
   const importHintTimeoutRef = useRef<number | null>(null);
+  const scanSummaryTimeoutRef = useRef<number | null>(null);
   const trackSearchInputRef = useRef<HTMLInputElement>(null);
   const preMuteVolumeRef = useRef(1.0);
   // Stable ref to handlePathDrop so drag-drop listener never re-registers
   const handlePathDropRef = useRef<typeof handlePathDrop | null>(null);
   // Debounce timer for localStorage queue writes
   const queueSaveTimerRef = useRef<number | null>(null);
+  const windowStateSaveTimerRef = useRef<number | null>(null);
   const lastStateUpdateRef = useRef({ elapsedMs: 0, timestamp: performance.now() });
 
   function updateAuthoritativeElapsed(ms: number) {
@@ -280,39 +354,15 @@ function App() {
   );
 
   useEffect(() => {
-    const preventNativeContextMenu = (event: MouseEvent) => event.preventDefault();
-    document.addEventListener("contextmenu", preventNativeContextMenu);
     return () => {
-      document.removeEventListener("contextmenu", preventNativeContextMenu);
       if (importHintTimeoutRef.current !== null) {
         window.clearTimeout(importHintTimeoutRef.current);
       }
+      if (scanSummaryTimeoutRef.current !== null) {
+        window.clearTimeout(scanSummaryTimeoutRef.current);
+      }
     };
   }, []);
-
-  // Local high-performance ticking loop to animate the progress bar smoothly
-  useEffect(() => {
-    if (isPaused || currentTrackId == null) {
-      return;
-    }
-
-    const intervalId = window.setInterval(() => {
-      const now = performance.now();
-      const delta = now - lastStateUpdateRef.current.timestamp;
-      const current = lastStateUpdateRef.current.elapsedMs + delta;
-
-      const durationSeconds = trackById.get(currentTrackId)?.durationSeconds ?? playbackDurationSeconds;
-      if (durationSeconds && current >= durationSeconds * 1000) {
-        setElapsedMs(durationSeconds * 1000);
-      } else {
-        setElapsedMs(Math.round(current));
-      }
-    }, 100);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [isPaused, currentTrackId, playbackDurationSeconds, trackById]);
 
   // Debounce queue persistence — only write after 300ms of no changes
   useEffect(() => {
@@ -320,10 +370,10 @@ function App() {
       window.clearTimeout(queueSaveTimerRef.current);
     }
     queueSaveTimerRef.current = window.setTimeout(() => {
-      window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(queuedTrackIds));
+      window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(queuedTracks));
       queueSaveTimerRef.current = null;
     }, 300);
-  }, [queuedTrackIds]);
+  }, [queuedTracks]);
 
   useEffect(() => {
     window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
@@ -333,10 +383,39 @@ function App() {
     window.localStorage.setItem(PLAYBACK_MODE_STORAGE_KEY, playbackMode);
   }, [playbackMode]);
 
+  useEffect(() => {
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (!scanSummary) {
+      if (scanSummaryTimeoutRef.current !== null) {
+        window.clearTimeout(scanSummaryTimeoutRef.current);
+        scanSummaryTimeoutRef.current = null;
+      }
+      return;
+    }
+
+    if (scanSummaryTimeoutRef.current !== null) {
+      window.clearTimeout(scanSummaryTimeoutRef.current);
+    }
+    scanSummaryTimeoutRef.current = window.setTimeout(() => {
+      setScanSummary(null);
+      scanSummaryTimeoutRef.current = null;
+    }, 4200);
+
+    return () => {
+      if (scanSummaryTimeoutRef.current !== null) {
+        window.clearTimeout(scanSummaryTimeoutRef.current);
+        scanSummaryTimeoutRef.current = null;
+      }
+    };
+  }, [scanSummary]);
+
   // Shuffle explicit queue when shuffle mode is enabled
   useEffect(() => {
     if (playbackMode === "shuffle") {
-      setQueuedTrackIds((current) => shuffleArray(current));
+      setQueuedTracks((current) => shuffleArray(current));
     }
   }, [playbackMode]);
 
@@ -346,10 +425,10 @@ function App() {
       setShuffledTrackIds((currentShuffled) => {
         const trackIds = tracks.map((t) => t.id);
         
-        // If current shuffled deck matches current track pool and contains current active track, keep it stable
+        // If current shuffled deck is a valid subset of current track pool and contains current active track, keep it stable
         const isStillValid =
           trackIds.length > 0 &&
-          currentShuffled.length === trackIds.length &&
+          currentShuffled.length > 0 &&
           currentShuffled.every((id) => trackIds.includes(id)) &&
           (currentTrackId == null || currentShuffled.includes(currentTrackId));
 
@@ -373,12 +452,104 @@ function App() {
   useEffect(() => {
     void loadLibrary();
     void refreshPlaybackState();
+    void refreshCliCommandStatus();
+  }, []);
+
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+
+    let cancelled = false;
+    void invoke<string[]>("take_pending_open_paths")
+      .then((paths) => {
+        if (cancelled || paths.length === 0) return;
+        void openAudioPathsFromSystem(paths);
+      })
+      .catch((caught) => {
+        if (!cancelled) {
+          setError(toErrorMessage(caught));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+
+    let unlisten: (() => void) | undefined;
+    void listen<string[]>("open_audio_paths", (event) => {
+      if (event.payload.length === 0) return;
+      void openAudioPathsFromSystem(event.payload);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    void (async () => {
+      const storedState = readStoredWindowState();
+      if (storedState) {
+        await restoreWindowState(appWindow, storedState);
+      }
+      await waitForNextFrame();
+      if (!disposed) {
+        await appWindow.show().catch(() => {
+          // Showing the window should not block app startup.
+        });
+      }
+    })();
+
+    const scheduleSave = () => {
+      if (windowStateSaveTimerRef.current !== null) {
+        window.clearTimeout(windowStateSaveTimerRef.current);
+      }
+      windowStateSaveTimerRef.current = window.setTimeout(() => {
+        windowStateSaveTimerRef.current = null;
+        void persistWindowState();
+      }, 180);
+    };
+
+    const unlistenFns: Array<() => void> = [];
+    void Promise.all([
+      appWindow.onResized(scheduleSave),
+      appWindow.onMoved(scheduleSave),
+    ]).then((unlisteners) => {
+      if (disposed) {
+        for (const unlisten of unlisteners) {
+          unlisten();
+        }
+        return;
+      }
+      unlistenFns.push(...unlisteners);
+    });
+
+    return () => {
+      disposed = true;
+      for (const unlisten of unlistenFns) {
+        unlisten();
+      }
+      if (windowStateSaveTimerRef.current !== null) {
+        window.clearTimeout(windowStateSaveTimerRef.current);
+        windowStateSaveTimerRef.current = null;
+      }
+      void persistWindowState();
+    };
   }, []);
 
   // O(1) queue cleanup using Map instead of O(n*m) Array.some
   useEffect(() => {
-    setQueuedTrackIds((current) =>
-      current.filter((trackId) => trackById.has(trackId)),
+    setQueuedTracks((current) =>
+      current.filter((item) => trackById.has(item.trackId)),
     );
   }, [trackById]);
 
@@ -446,6 +617,131 @@ function App() {
     };
   // Empty deps: register once and use the stable ref for the latest handler
   }, []);
+
+  // Stable refs for media keys and tray events to avoid stale closures
+  const togglePlayPauseRef = useRef(togglePlayPause);
+  const playRelativeTrackRef = useRef(playRelativeTrack);
+  useEffect(() => {
+    togglePlayPauseRef.current = togglePlayPause;
+    playRelativeTrackRef.current = playRelativeTrack;
+  });
+
+  // Listen to tray and media key shortcuts
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+
+    const unlisteners: Array<() => void> = [];
+
+    const eventActions = [
+      { name: "tray_play_pause", action: () => togglePlayPauseRef.current() },
+      { name: "tray_next", action: () => playRelativeTrackRef.current(1) },
+      { name: "tray_prev", action: () => playRelativeTrackRef.current(-1) },
+      { name: "global_play_pause", action: () => togglePlayPauseRef.current() },
+      { name: "global_next", action: () => playRelativeTrackRef.current(1) },
+      { name: "global_prev", action: () => playRelativeTrackRef.current(-1) },
+    ];
+
+    void Promise.all(
+      eventActions.map((ev) =>
+        listen(ev.name, () => {
+          ev.action();
+        })
+      )
+    ).then((unlistenFns) => {
+      unlisteners.push(...unlistenFns);
+    });
+
+    return () => {
+      for (const unlisten of unlisteners) {
+        unlisten();
+      }
+    };
+  }, []);
+
+  // Listen to scan progress updates
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+
+    let unlisten: (() => void) | undefined;
+    void listen<{
+      folder_id: number;
+      scanned: number;
+      added: number;
+      current_file: string;
+      is_done: boolean;
+    }>("scan_progress", (event) => {
+      const payload = event.payload;
+      if (payload.is_done) {
+        setScanProgress(null);
+      } else {
+        setScanProgress({
+          scanned: payload.scanned,
+          added: payload.added,
+          currentFile: payload.current_file,
+        });
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  // Fetch cover art URL when current track changes
+  useEffect(() => {
+    if (currentTrackId == null) {
+      setCurrentCoverUrl(undefined);
+      return;
+    }
+
+    let active = true;
+    void invoke<string | null>("get_track_cover_art", { trackId: currentTrackId })
+      .then((art) => {
+        if (active) {
+          setCurrentCoverUrl(art ?? undefined);
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to fetch cover art", err);
+        if (active) {
+          setCurrentCoverUrl(undefined);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [currentTrackId]);
+
+  // Show HTML5 Native OS Notification on track change
+  useEffect(() => {
+    if (currentTrackId == null || !currentTrack) return;
+
+    if (typeof Notification !== "undefined") {
+      const showNotification = () => {
+        const body = `${currentTrack.title || currentTrack.fileName}${
+          currentTrack.artist ? ` - ${currentTrack.artist}` : ""
+        }`;
+        new Notification("Now Playing", {
+          body,
+          icon: currentCoverUrl,
+          silent: true,
+        });
+      };
+
+      if (Notification.permission === "granted") {
+        showNotification();
+      } else if (Notification.permission !== "denied") {
+        void Notification.requestPermission().then((permission) => {
+          if (permission === "granted") {
+            showNotification();
+          }
+        });
+      }
+    }
+  }, [currentTrackId, currentCoverUrl]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -531,23 +827,41 @@ function App() {
       return;
     }
 
-    if (elapsedMs >= durationSeconds * 1000 - 250) {
+    const now = performance.now();
+    const estimatedElapsedMs =
+      lastStateUpdateRef.current.elapsedMs + (now - lastStateUpdateRef.current.timestamp);
+    const remainingMs = durationSeconds * 1000 - estimatedElapsedMs - 250;
+
+    const triggerAutoNext = () => {
       autoNextInFlightRef.current = true;
       setLastAutoNextTrackId(currentTrack.id);
       const next =
         playbackMode === "repeat-one" ? playTrack(currentTrack.id) : playRelativeTrack(1);
       void next.finally(() => {
-          autoNextInFlightRef.current = false;
-        });
+        autoNextInFlightRef.current = false;
+      });
+    };
+
+    if (remainingMs <= 0) {
+      triggerAutoNext();
+      return;
     }
+
+    const timeoutId = window.setTimeout(triggerAutoNext, remainingMs);
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
   }, [
     currentTrackId,
-    elapsedMs,
     isPaused,
     lastAutoNextTrackId,
     playbackMode,
     playbackDurationSeconds,
     trackById,
+    queuedTracks,
+    shuffledTrackIds,
+    selectedTrackId,
+    tracks,
   ]);
 
   async function loadLibrary() {
@@ -576,26 +890,44 @@ function App() {
     }
   }
 
-  async function addAndScanFolder() {
-    if (!isRunningInTauri()) {
-      setError("open this in the Tauri app to scan local folders.");
+  async function refreshCliCommandStatus() {
+    if (!isRunningInTauri()) return;
+
+    try {
+      const status = await invoke<CliCommandStatus>("get_cli_command_status");
+      setCliCommandStatus(status);
+    } catch {
+      // Optional installer status should stay quiet.
+    }
+  }
+
+  async function openAudioPathsFromSystem(paths: string[]) {
+    if (!isRunningInTauri() || paths.length === 0) return;
+
+    const invalidFolderPath = paths.find(
+      (path) => !looksLikeAudioPath(path) && validateMusicFolderPath(path) != null,
+    );
+    if (invalidFolderPath) {
+      setError(validateMusicFolderPath(invalidFolderPath));
       return;
     }
 
     setIsScanning(true);
     setError(null);
-    setScanSummary(null);
-
     try {
-      const folder = await invoke<BackendFolder>("add_music_folder", { path: folderPath });
-      const summary = await invoke<ScanSummary>("scan_music_folder", {
-        folderId: folder.id,
-      });
-      setScanSummary(
-        `scanned ${summary.scanned} / added ${summary.added} / errors ${summary.errors}`,
-      );
-      setFolderPath("");
+      const summary = await invoke<ImportSummary>("import_music_paths", { paths });
+      setView("all-tracks");
       await loadLibrary();
+
+      if (summary.track_ids.length > 0 && paths.some(looksLikeAudioPath)) {
+        await playTrack(summary.track_ids[0]);
+      }
+
+      showImportHint(
+        paths.length === 1 && looksLikeAudioPath(paths[0])
+          ? `opened ${fileNameFromPath(paths[0])}`
+          : formatImportHint(paths, summary, { type: "all-tracks" }),
+      );
     } catch (caught) {
       setError(toErrorMessage(caught));
     } finally {
@@ -603,10 +935,74 @@ function App() {
     }
   }
 
-  async function rescanLibrary() {
+  async function persistWindowState() {
+    if (!isRunningInTauri()) return;
+
+    try {
+      const appWindow = getCurrentWindow();
+      const [isMaximized, outerSize, outerPosition] = await Promise.all([
+        appWindow.isMaximized(),
+        appWindow.outerSize(),
+        appWindow.outerPosition(),
+      ]);
+
+      const nextState: StoredWindowState = {
+        isMaximized,
+        width: outerSize.width,
+        height: outerSize.height,
+        x: outerPosition.x,
+        y: outerPosition.y,
+      };
+      window.localStorage.setItem(WINDOW_STATE_STORAGE_KEY, JSON.stringify(nextState));
+    } catch {
+      // Persisting window state should stay silent.
+    }
+  }
+
+  async function restoreWindowState(appWindow: ReturnType<typeof getCurrentWindow>, state: StoredWindowState) {
+    try {
+      const monitors = await availableMonitors();
+      const monitor = findMonitorForWindowState(monitors, state) ?? (await primaryMonitor());
+      const nextPosition = monitor ? clampWindowStateToMonitor(state, monitor) : state;
+
+      await appWindow.setSize(new PhysicalSize(state.width, state.height));
+      await appWindow.setPosition(new PhysicalPosition(nextPosition.x, nextPosition.y));
+      if (state.isMaximized) {
+        await appWindow.maximize();
+      }
+    } catch {
+      // Invalid persisted window coordinates should not block launch.
+    }
+  }
+
+  async function cancelScanning() {
+    if (scanningFolderId !== null) {
+      try {
+        await invoke("cancel_scan_music_folder", { folderId: scanningFolderId });
+        setScanningFolderId(null);
+        setScanProgress(null);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+  }
+
+  async function addAndScanFolder(pathOverride?: string) {
     if (!isRunningInTauri()) {
-      setError("open this in the Tauri app to rescan local folders.");
-      return;
+      setError("open this in the Tauri app to scan local folders.");
+      return false;
+    }
+
+    const targetPath = (pathOverride ?? folderPath).trim();
+    if (!targetPath) {
+      setError("pick a folder first.");
+      return false;
+    }
+
+    const invalidReason = validateMusicFolderPath(targetPath);
+    if (invalidReason) {
+      setError(invalidReason);
+      return false;
     }
 
     setIsScanning(true);
@@ -614,15 +1010,127 @@ function App() {
     setScanSummary(null);
 
     try {
-      const summary = await invoke<ScanSummary>("rescan_library");
-      setScanSummary(
-        `rescanned ${summary.scanned} / added ${summary.added} / errors ${summary.errors}`,
-      );
+      const folder = await invoke<BackendFolder>("add_music_folder", { path: targetPath });
+      setScanningFolderId(folder.id);
+      
+      const summary = await invoke<ScanSummary>("scan_music_folder", {
+        folderId: folder.id,
+      });
+      
+      const skipped = summary.scanned - summary.added - summary.errors;
+      let summaryText = `Scanned ${summary.scanned} files / Added ${summary.added} new / Errors ${summary.errors}`;
+      if (skipped > 0) {
+        summaryText += ` / Warning: Skipped ${skipped} duplicate(s) already in library`;
+      }
+      
+      setScanSummary(summaryText);
+      setFolderPath("");
       await loadLibrary();
+      return true;
     } catch (caught) {
       setError(toErrorMessage(caught));
+      return false;
     } finally {
       setIsScanning(false);
+      setScanningFolderId(null);
+    }
+  }
+
+  async function toggleTrackLiked(trackId: number) {
+    try {
+      await invoke("toggle_track_liked", { trackId });
+      await loadLibrary();
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  async function rescanFolder(folderId: number) {
+    setIsScanning(true);
+    setError(null);
+    setScanSummary(null);
+    setScanningFolderId(folderId);
+    try {
+      const summary = await invoke<ScanSummary>("scan_music_folder", { folderId });
+      const skipped = summary.scanned - summary.added - summary.errors;
+      let summaryText = `Scanned ${summary.scanned} files / Added ${summary.added} new / Errors ${summary.errors}`;
+      if (skipped > 0) {
+        summaryText += ` / Warning: Skipped ${skipped} duplicate(s) already in library`;
+      }
+      setScanSummary(summaryText);
+      await loadLibrary();
+    } catch (err) {
+      setError(toErrorMessage(err));
+    } finally {
+      setIsScanning(false);
+      setScanningFolderId(null);
+    }
+  }
+
+  async function toggleFolderPinned(folderId: number) {
+    try {
+      await invoke("toggle_folder_pinned", { folderId });
+      await loadLibrary();
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  async function relinkFolder(folderId: number) {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose New Path for Folder",
+      });
+      if (selected && typeof selected === "string") {
+        await invoke("relink_folder_path", { folderId, newPath: selected });
+        await loadLibrary();
+        showImportHint("Folder path relinked successfully.");
+      }
+    } catch (err) {
+      setError(toErrorMessage(err));
+    }
+  }
+
+  async function relinkTrack(trackId: number) {
+    try {
+      const selected = await open({
+        directory: false,
+        multiple: false,
+        title: "Relink Track File",
+      });
+      if (selected && typeof selected === "string") {
+        await invoke("relink_track_path", { trackId, newPath: selected });
+        await loadLibrary();
+        showImportHint("Track file relinked successfully.");
+      }
+    } catch (err) {
+      setError(toErrorMessage(err));
+    }
+  }
+
+  async function openFolderPicker() {
+    if (!isRunningInTauri()) {
+      setError("open this in the Tauri app to pick a local folder.");
+      return false;
+    }
+
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose music folder",
+      });
+      if (typeof selected !== "string" || selected.trim() === "") {
+        return false;
+      }
+
+      setFolderPath(selected);
+      return await addAndScanFolder(selected);
+    } catch (caught) {
+      setError(toErrorMessage(caught));
+      return false;
     }
   }
 
@@ -654,10 +1162,10 @@ function App() {
 
     const baseTrackId = currentTrackId ?? selectedTrackId ?? tracks[0]?.id;
     const currentIndex = tracks.findIndex((track) => track.id === baseTrackId);
-    if (direction === 1 && queuedTrackIds.length > 0) {
-      const [nextQueuedTrackId, ...remainingQueuedTrackIds] = queuedTrackIds;
-      setQueuedTrackIds(remainingQueuedTrackIds);
-      await playTrack(nextQueuedTrackId);
+    if (direction === 1 && queuedTracks.length > 0) {
+      const [nextQueuedItem, ...remainingQueuedTracks] = queuedTracks;
+      setQueuedTracks(remainingQueuedTracks);
+      await playTrack(nextQueuedItem.trackId);
       return;
     }
 
@@ -690,9 +1198,123 @@ function App() {
     const track = tracks.find((candidate) => candidate.id === trackId);
     if (!track) return;
 
-    setQueuedTrackIds((current) => [...current, trackId]);
+    setQueuedTracks((current) => [
+      ...current,
+      { id: `${trackId}-${Math.random()}-${Date.now()}`, trackId },
+    ]);
     setQueueOpen(true);
     showImportHint(`queued ${track.title || track.fileName}`);
+  }
+
+  function playNext(trackId: number) {
+    const track = tracks.find((candidate) => candidate.id === trackId);
+    if (!track) return;
+
+    setQueuedTracks((current) => [
+      { id: `${trackId}-${Math.random()}-${Date.now()}`, trackId },
+      ...current,
+    ]);
+    showImportHint(`play next: ${track.title || track.fileName}`);
+  }
+
+  function removeTrackFromQueue(queueItemId: string) {
+    setQueuedTracks((current) => current.filter((item) => item.id !== queueItemId));
+  }
+
+  function reorderQueue(fromIndex: number, toIndex: number) {
+    const explicitCount = queuedTracks.length;
+
+    // 1. Check if we are reordering entirely within the explicit queue
+    if (fromIndex < explicitCount && toIndex < explicitCount) {
+      setQueuedTracks((current) => {
+        const next = [...current];
+        const [removed] = next.splice(fromIndex, 1);
+        next.splice(toIndex, 0, removed);
+        return next;
+      });
+      return;
+    }
+
+    // 2. Check if we are reordering entirely within the shuffle deck
+    if (playbackMode === "shuffle" && fromIndex >= explicitCount && toIndex >= explicitCount) {
+      const fallbackFrom = fromIndex - explicitCount;
+      const fallbackTo = toIndex - explicitCount;
+      reorderShuffleDeck(fallbackFrom, fallbackTo);
+      return;
+    }
+
+    // 3. Otherwise, crossing boundaries: promoting fallback tracks to explicit
+    const explicitIds = queuedTracks.map((item) => item.trackId);
+    let fallbackIds: number[] = [];
+    if (playbackMode === "shuffle") {
+      const currentIdx = shuffledTrackIds.indexOf(currentTrackId ?? -1);
+      const startIdx = currentIdx !== -1 ? currentIdx + 1 : 0;
+      fallbackIds = shuffledTrackIds.slice(startIdx);
+    } else {
+      const currentIdx = tracks.findIndex((t) => t.id === currentTrackId);
+      const startIdx = currentIdx !== -1 ? currentIdx + 1 : 0;
+      fallbackIds = tracks.slice(startIdx, startIdx + 50).map((t) => t.id);
+    }
+
+    const unifiedIds = [...explicitIds, ...fallbackIds];
+
+    if (fromIndex < 0 || fromIndex >= unifiedIds.length || toIndex < 0 || toIndex >= unifiedIds.length) {
+      return;
+    }
+    const [removedId] = unifiedIds.splice(fromIndex, 1);
+    unifiedIds.splice(toIndex, 0, removedId);
+
+    const newExplicitCount = Math.max(explicitCount, fromIndex + 1, toIndex + 1);
+    const newExplicitIds = unifiedIds.slice(0, newExplicitCount);
+
+    setQueuedTracks(
+      newExplicitIds.map((trackId) => ({
+        id: `${trackId}-${Math.random()}-${Date.now()}`,
+        trackId,
+      }))
+    );
+
+    if (playbackMode === "shuffle") {
+      const currentIdx = shuffledTrackIds.indexOf(currentTrackId ?? -1);
+      const startIdx = currentIdx !== -1 ? currentIdx + 1 : 0;
+      const newFallbackIds = unifiedIds.slice(newExplicitCount);
+      setShuffledTrackIds((current) => {
+        const next = [...current];
+        next.splice(startIdx, next.length - startIdx, ...newFallbackIds);
+        return next;
+      });
+    }
+  }
+
+  async function playQueueItem(queueItemId: string) {
+    const index = queuedTracks.findIndex((item) => item.id === queueItemId);
+    if (index === -1) return;
+
+    const targetItem = queuedTracks[index];
+    const remaining = queuedTracks.slice(index + 1);
+    setQueuedTracks(remaining);
+    await playTrack(targetItem.trackId);
+  }
+
+  function reorderShuffleDeck(fromIndex: number, toIndex: number) {
+    setShuffledTrackIds((current) => {
+      const next = [...current];
+      const currentIdx = next.indexOf(currentTrackId ?? -1);
+      const startIdx = currentIdx !== -1 ? currentIdx + 1 : 0;
+
+      const actualFrom = startIdx + fromIndex;
+      const actualTo = startIdx + toIndex;
+
+      if (actualFrom >= 0 && actualFrom < next.length && actualTo >= 0 && actualTo < next.length) {
+        const [removed] = next.splice(actualFrom, 1);
+        next.splice(actualTo, 0, removed);
+      }
+      return next;
+    });
+  }
+
+  function removeFromShuffleDeck(trackId: number) {
+    setShuffledTrackIds((current) => current.filter((id) => id !== trackId));
   }
 
   async function togglePlayPause() {
@@ -772,6 +1394,12 @@ function App() {
   async function handlePathDrop(paths: string[], target: DropTarget | null) {
     if (!target || paths.length === 0) return;
 
+    const invalidFolder = paths.find((path) => validateMusicFolderPath(path) != null);
+    if (invalidFolder) {
+      setError(validateMusicFolderPath(invalidFolder));
+      return;
+    }
+
     setIsScanning(true);
     try {
       const summary = await invoke<ImportSummary>("import_music_paths", { paths });
@@ -801,6 +1429,22 @@ function App() {
     }
   }
 
+  async function installCliCommand() {
+    if (!isRunningInTauri() || isInstallingCliCommand) return;
+
+    setIsInstallingCliCommand(true);
+    try {
+      const status = await invoke<CliCommandStatus>("install_cli_command");
+      setCliCommandStatus(status);
+      setError(null);
+      showImportHint("installed dww command");
+    } catch (caught) {
+      setError(toErrorMessage(caught));
+    } finally {
+      setIsInstallingCliCommand(false);
+    }
+  }
+
   function showImportHint(message: string) {
     if (importHintTimeoutRef.current !== null) {
       window.clearTimeout(importHintTimeoutRef.current);
@@ -813,22 +1457,50 @@ function App() {
     }, 2600);
   }
 
+  function completeQuickSetup() {
+    window.localStorage.setItem(QUICK_SETUP_STORAGE_KEY, "done");
+    setQuickSetupOpen(false);
+  }
+
   function applyPlaybackState(playback: PlaybackState) {
     setCurrentTrackId(playback.current_track_id);
     setIsPaused(playback.is_paused);
     setVolumeState(playback.volume);
     updateAuthoritativeElapsed(playback.elapsed_ms);
     setPlaybackDurationSeconds(playback.duration_seconds ?? undefined);
+    if (playback.gain !== undefined) {
+      setVolumeGain(playback.gain);
+    }
   }
 
   // O(1) current track lookup using pre-built Map
   const currentTrack = currentTrackId != null ? trackById.get(currentTrackId) : undefined;
 
   return (
-    <main className={`theme-${theme} h-full bg-background text-body-md text-on-surface`}>
+    <main
+      className={[
+        `theme-${theme}`,
+        "h-full bg-background text-body-md text-on-surface",
+        isLinuxDesktop() ? "dwt-platform-linux" : "",
+      ].join(" ")}
+    >
       <div className="dwt-window relative flex h-full flex-col bg-background">
         {dropTarget ? <DropOverlay target={dropTarget} /> : null}
         {importHint ? <ImportHint message={importHint} /> : null}
+        {quickSetupOpen ? (
+          <QuickSetupDialog
+            cliCommandStatus={cliCommandStatus}
+            error={error}
+            isInstallingCliCommand={isInstallingCliCommand}
+            isScanning={isScanning}
+            theme={theme}
+            onComplete={completeQuickSetup}
+            onInstallCliCommand={installCliCommand}
+            onOpenFolderPicker={openFolderPicker}
+            onAddFolderWithPath={addAndScanFolder}
+            onThemeChange={setTheme}
+          />
+        ) : null}
         {fileNotFoundTrackId != null ? (
           <FileNotFoundDialog
             track={trackById.get(fileNotFoundTrackId)}
@@ -855,6 +1527,10 @@ function App() {
             }}
             onAddToQueue={() => {
               addTrackToQueue(trackContextMenu.trackId);
+              setTrackContextMenu(null);
+            }}
+            onPlayNext={() => {
+              playNext(trackContextMenu.trackId);
               setTrackContextMenu(null);
             }}
             onClose={() => setTrackContextMenu(null)}
@@ -887,7 +1563,22 @@ function App() {
             width={sidebarWidth}
             view={view}
             onResize={setSidebarWidth}
-            onViewChange={setView}
+            onViewChange={(v) => {
+              setView(v);
+              if (v !== "all-tracks") {
+                setFilterFolderId(null);
+              }
+            }}
+            playlists={playlists}
+            folders={folders}
+            onSelectPlaylist={(playlistId) => {
+              setView("playlists");
+              void playlistId; // PlaylistsView manages its own selected state
+            }}
+            onSelectFolder={(folderId) => {
+              setView("all-tracks");
+              setFilterFolderId(folderId);
+            }}
           />
           <section className="flex min-w-0 flex-1 flex-col">
             {view === "all-tracks" && (
@@ -895,17 +1586,24 @@ function App() {
                 folderPath={folderPath}
                 onFolderPathChange={setFolderPath}
                 onAddFolder={addAndScanFolder}
+                onOpenFolderPicker={openFolderPicker}
                 searchInputRef={trackSearchInputRef}
                 selectedTrackId={selectedTrackId}
                 onSelectTrack={setSelectedTrackId}
                 currentTrackId={currentTrackId}
                 onPlayTrack={playTrack}
                 onAddToQueue={addTrackToQueue}
+                onPlayNext={playNext}
                 playlists={playlists}
-                tracks={tracks.filter((track) => !hiddenTrackIds.has(track.id))}
+                tracks={tracks
+                  .filter((track) => !hiddenTrackIds.has(track.id))
+                  .filter((track) => filterFolderId === null || track.folderId === filterFolderId)
+                }
                 error={error}
                 isScanning={isScanning}
                 scanSummary={scanSummary}
+                scanProgress={scanProgress}
+                onCancelScan={cancelScanning}
                 onAddTrackToPlaylist={async (trackId, playlistId) => {
                   await invoke("add_track_to_playlist", { trackId, playlistId });
                   await loadLibrary();
@@ -917,18 +1615,49 @@ function App() {
                 onHideTrack={(trackId) =>
                   setHiddenTrackIds((current) => new Set(current).add(trackId))
                 }
+                onToggleLiked={toggleTrackLiked}
+                filterFolderId={filterFolderId}
+                onClearFolderFilter={() => setFilterFolderId(null)}
+                folders={folders}
                 isPaused={isPaused}
               />
             )}
-            {view === "folders" && (
-                <FoldersView
-                  error={error}
-                  folders={folders}
-                  isScanning={isScanning}
-                  scanSummary={scanSummary}
-                  onRescanLibrary={rescanLibrary}
-                />
-              )}
+            {view === "liked" && (
+              <AllTracksView
+                folderPath={folderPath}
+                onFolderPathChange={setFolderPath}
+                onAddFolder={addAndScanFolder}
+                onOpenFolderPicker={openFolderPicker}
+                searchInputRef={trackSearchInputRef}
+                selectedTrackId={selectedTrackId}
+                onSelectTrack={setSelectedTrackId}
+                currentTrackId={currentTrackId}
+                onPlayTrack={playTrack}
+                onAddToQueue={addTrackToQueue}
+                onPlayNext={playNext}
+                playlists={playlists}
+                tracks={tracks.filter((track) => !hiddenTrackIds.has(track.id) && track.liked)}
+                error={error}
+                isScanning={isScanning}
+                scanSummary={scanSummary}
+                scanProgress={scanProgress}
+                onCancelScan={cancelScanning}
+                onAddTrackToPlaylist={async (trackId, playlistId) => {
+                  await invoke("add_track_to_playlist", { trackId, playlistId });
+                  await loadLibrary();
+                }}
+                onCreatePlaylistForTrack={(trackId, initialName) =>
+                  setPlaylistCreateRequest({ trackId, initialName })
+                }
+                onEditTrackMetadata={(trackId) => setMetadataEditTrackId(trackId)}
+                onHideTrack={(trackId) =>
+                  setHiddenTrackIds((current) => new Set(current).add(trackId))
+                }
+                onToggleLiked={toggleTrackLiked}
+                isLikedView={true}
+                isPaused={isPaused}
+              />
+            )}
             {view === "albums" && (
               <AlbumsView
                 albums={buildAlbums(tracks)}
@@ -964,13 +1693,18 @@ function App() {
         <QueuePanel
           currentTrackId={currentTrackId}
           open={queueOpen}
-          queuedTrackIds={queuedTrackIds}
+          queuedTracks={queuedTracks}
           tracks={tracks}
           shuffledTrackIds={shuffledTrackIds}
           playbackMode={playbackMode}
           onClose={() => setQueueOpen(false)}
           onTrackContextMenu={(trackId, x, y) => setTrackContextMenu({ trackId, x, y })}
           onPlayTrack={(trackId) => void playTrack(trackId)}
+          onPlayQueueItem={(queueItemId) => void playQueueItem(queueItemId)}
+          onRemoveQueueItem={removeTrackFromQueue}
+          onReorderQueue={reorderQueue}
+          onRemoveFromShuffleDeck={removeFromShuffleDeck}
+          onClearQueue={() => setQueuedTracks([])}
           isPaused={isPaused}
         />
         {playlistCreateRequest ? (
@@ -1006,23 +1740,44 @@ function App() {
         ) : null}
         {settingsOpen ? (
           <SettingsDialog
-            folderCount={folders.length}
-            hiddenTrackCount={hiddenTrackIds.size}
+            folders={folders}
+            cliCommandStatus={cliCommandStatus}
+            isInstallingCliCommand={isInstallingCliCommand}
             onClearHiddenTracks={() => setHiddenTrackIds(new Set())}
-            onClearQueue={() => setQueuedTrackIds([])}
-            playlistCount={playlists.length}
+            onClearQueue={() => setQueuedTracks([])}
+            onInstallCliCommand={installCliCommand}
             playbackMode={playbackMode}
             sidebarWidth={sidebarWidth}
             onPlaybackModeChange={setPlaybackMode}
             onSidebarWidthChange={setSidebarWidth}
-            trackCount={tracks.length}
+            onOpenQuickSetup={() => {
+              setSettingsOpen(false);
+              setQuickSetupOpen(true);
+            }}
             theme={theme}
             volume={volume}
-            onClose={() => setSettingsOpen(false)}
-            onThemeChange={(nextTheme) => {
-              setTheme(nextTheme);
-              window.localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+            volumeGain={volumeGain}
+            onVolumeGainChange={async (gain) => {
+              try {
+                await invoke("set_volume_gain", { gain });
+                setVolumeGain(gain);
+              } catch (err) {
+                console.error(err);
+              }
             }}
+            onScanFolder={rescanFolder}
+            onToggleFolderPinned={toggleFolderPinned}
+            onRelinkFolder={relinkFolder}
+            onRelinkTrack={relinkTrack}
+            onLibraryChanged={loadLibrary}
+            missingTracks={missingTracks}
+            setMissingTracks={setMissingTracks}
+            hasCheckedHealth={hasCheckedHealth}
+            setHasCheckedHealth={setHasCheckedHealth}
+            showImportHint={showImportHint}
+            setError={setError}
+            onClose={() => setSettingsOpen(false)}
+            onThemeChange={setTheme}
           />
         ) : null}
         {shortcutsOpen ? (
@@ -1034,7 +1789,7 @@ function App() {
           isPaused={isPaused}
           playbackMode={playbackMode}
           volume={volume}
-          elapsedMs={elapsedMs}
+          authoritativeElapsedMs={elapsedMs}
           onNext={() => void playRelativeTrack(1)}
           onPrevious={() => void playRelativeTrack(-1)}
           onQueueToggle={() => setQueueOpen((value) => !value)}
@@ -1067,6 +1822,18 @@ function TopAppBar({
     void appWindow.isMaximized().then(setIsMaximized).catch(() => setIsMaximized(false));
   }, []);
 
+  async function startWindowDrag(event: ReactMouseEvent<HTMLElement>) {
+    if (!isRunningInTauri() || event.button !== 0) return;
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || target.closest(".no-drag")) return;
+
+    try {
+      await getCurrentWindow().startDragging();
+    } catch {
+      // Best-effort fallback for Linux custom title bars.
+    }
+  }
+
   async function runWindowAction(action: "minimize" | "toggleMaximize" | "close") {
     if (!isRunningInTauri()) return;
     const appWindow = getCurrentWindow();
@@ -1092,6 +1859,7 @@ function TopAppBar({
     <header
       className="drag-region flex h-h-bar shrink-0 items-center border-b border-surface-container-high bg-surface-container-low px-lg"
       data-tauri-drag-region
+      onMouseDown={(event) => void startWindowDrag(event)}
     >
       <button
         aria-label="toggle sidebar"
@@ -1166,38 +1934,307 @@ function WindowControls({
   );
 }
 
+function QuickSetupDialog({
+  cliCommandStatus,
+  error,
+  isInstallingCliCommand,
+  isScanning,
+  theme,
+  onInstallCliCommand,
+  onComplete,
+  onOpenFolderPicker,
+  onAddFolderWithPath,
+  onThemeChange,
+}: {
+  cliCommandStatus: CliCommandStatus | null;
+  error: string | null;
+  isInstallingCliCommand: boolean;
+  isScanning: boolean;
+  theme: AppTheme;
+  onInstallCliCommand: () => Promise<void>;
+  onComplete: () => void;
+  onOpenFolderPicker: () => Promise<boolean>;
+  onAddFolderWithPath: (path: string) => Promise<boolean>;
+  onThemeChange: (theme: AppTheme) => void;
+}) {
+  const [isClosing, setIsClosing] = useState(false);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [testPlaying, setTestPlaying] = useState(false);
+
+  useEffect(() => {
+    if (isRunningInTauri()) {
+      invoke<string[]>("get_system_music_folders")
+        .then(setSuggestions)
+        .catch(console.error);
+    }
+  }, []);
+
+  function completeAndClose() {
+    setIsClosing(true);
+    window.setTimeout(onComplete, 180);
+  }
+
+  async function handlePickFolder() {
+    const didImport = await onOpenFolderPicker();
+    if (didImport) {
+      completeAndClose();
+    }
+  }
+
+  async function handleSelectSuggestion(path: string) {
+    const didImport = await onAddFolderWithPath(path);
+    if (didImport) {
+      completeAndClose();
+    }
+  }
+
+  async function handlePlayTestSound() {
+    if (!isRunningInTauri()) return;
+    try {
+      setTestPlaying(true);
+      await invoke("play_test_sound");
+      window.setTimeout(() => setTestPlaying(false), 1500);
+    } catch (e) {
+      console.error(e);
+      setTestPlaying(false);
+    }
+  }
+
+  return (
+    <div
+      className={[
+        "wave-dim-layer absolute inset-0 z-45 grid place-items-center",
+        isClosing ? "wave-overlay-exit" : "",
+      ].join(" ")}
+    >
+      <section
+        aria-label="quick setup"
+        className={[
+          "wave-dialog-panel w-[520px] max-w-[calc(100vw-32px)] border border-outline-variant bg-surface-container-low",
+          isClosing ? "wave-popover-exit" : "",
+        ].join(" ")}
+      >
+        <header className="flex items-start justify-between gap-md border-b border-surface-container-high px-lg py-md">
+          <div className="min-w-0">
+            <div className="mb-xs text-label-caps uppercase text-on-surface-variant">quick setup</div>
+            <h2 className="m-0 text-headline font-semibold text-on-surface">set the mood, then pick your music</h2>
+            <p className="mb-0 mt-xs text-body-sm text-on-surface-variant">
+              choose a theme and start with a music folder. avoid scanning a whole drive like
+              {" "}
+              <span className="text-on-surface">{`C:\\`}</span>
+              {" "}
+              or
+              {" "}
+              <span className="text-on-surface">{`D:\\`}</span>
+              .
+            </p>
+          </div>
+          <button
+            className="h-h-row shrink-0 border border-outline-variant px-sm text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
+            type="button"
+            onClick={completeAndClose}
+          >
+            skip
+          </button>
+        </header>
+        <div className="p-lg">
+          <div className="mb-sm text-label-caps uppercase text-on-surface-variant">theme</div>
+          <div className="grid gap-xs border border-outline-variant">
+            {THEME_OPTIONS.map((option) => (
+              <button
+                key={option.theme}
+                className={[
+                  "grid h-h-row w-full grid-cols-[32px_minmax(0,1fr)_64px_24px] items-center border-b border-outline-variant px-md text-left text-body-sm last:border-b-0 hover:bg-surface-container-high",
+                  option.theme === theme ? "bg-surface-variant text-primary" : "text-on-surface-variant",
+                ].join(" ")}
+                type="button"
+                onClick={() => onThemeChange(option.theme)}
+              >
+                <ThemeSwatch theme={option.theme} />
+                <span className="truncate text-on-surface">{option.label}</span>
+                <span className="text-label uppercase tracking-[0.12em]">{option.tone}</span>
+                {option.theme === theme ? <Icon name="check" size={16} /> : null}
+              </button>
+            ))}
+          </div>
+
+          <div className="mb-sm mt-lg text-label-caps uppercase text-on-surface-variant">library & sound</div>
+          <div className="border border-outline-variant p-md">
+            <p className="m-0 text-body-sm text-on-surface-variant">
+              pick your main music folder first. you can add more folders later from
+              {" "}
+              <span className="text-on-surface">all tracks</span>
+              .
+            </p>
+            
+            {suggestions.length > 0 && (
+              <div className="mt-sm flex flex-col gap-xs">
+                <span className="text-body-xs text-on-surface-variant font-medium">SUGGESTED MUSIC DIRECTORIES:</span>
+                <div className="flex flex-wrap gap-xs">
+                  {suggestions.map((path) => (
+                    <button
+                      key={path}
+                      className="flex items-center gap-xs rounded bg-surface-container-high hover:bg-surface-container-highest px-xs py-xxs text-body-xs text-on-surface text-left border border-outline-variant/50 max-w-full truncate"
+                      title={path}
+                      disabled={isScanning}
+                      type="button"
+                      onClick={() => void handleSelectSuggestion(path)}
+                    >
+                      <Icon name="folder" size={12} />
+                      <span className="truncate">{path.split(/[\\/]/).pop() || path}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="mt-md flex items-center justify-between gap-sm">
+              <div className="flex items-center gap-sm">
+                <button
+                  className="h-h-row border border-primary px-md text-body-sm text-primary hover:bg-surface-variant hover:text-on-surface disabled:opacity-50"
+                  disabled={isScanning}
+                  type="button"
+                  onClick={() => {
+                    void handlePickFolder();
+                  }}
+                >
+                  {isScanning ? "scanning..." : "choose music folder"}
+                </button>
+                <button
+                  className="h-h-row border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
+                  type="button"
+                  onClick={completeAndClose}
+                >
+                  finish later
+                </button>
+              </div>
+
+              <button
+                className={[
+                  "h-h-row border px-md text-body-sm flex items-center gap-xs transition-all",
+                  testPlaying 
+                    ? "border-primary bg-primary/10 text-primary font-bold animate-pulse" 
+                    : "border-outline-variant text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
+                ].join(" ")}
+                type="button"
+                onClick={handlePlayTestSound}
+              >
+                <Icon name={testPlaying ? "volume_up" : "music_note"} size={16} />
+                <span>{testPlaying ? "playing chime..." : "test sound"}</span>
+              </button>
+            </div>
+            {error ? <p className="mb-0 mt-sm text-body-sm text-error">{error}</p> : null}
+          </div>
+
+          {!isWindowsDesktop() ? (
+            <>
+              <div className="mb-sm mt-lg text-label-caps uppercase text-on-surface-variant">
+                terminal
+              </div>
+              <div className="border border-outline-variant p-md">
+                <p className="m-0 text-body-sm text-on-surface-variant">
+                  install
+                  {" "}
+                  <span className="text-on-surface">dww</span>
+                  {" "}
+                  so you can launch the app from a terminal.
+                </p>
+                <div className="mt-md flex items-center gap-sm">
+                  <button
+                    className="h-h-row border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface disabled:opacity-50"
+                    disabled={isInstallingCliCommand || cliCommandStatus?.installed === true}
+                    type="button"
+                    onClick={() => {
+                      void onInstallCliCommand();
+                    }}
+                  >
+                    {cliCommandStatus?.installed
+                      ? "dww ready"
+                      : isInstallingCliCommand
+                        ? "installing..."
+                        : "install dww"}
+                  </button>
+                  {cliCommandStatus?.location ? (
+                    <span className="truncate text-body-sm text-on-surface-variant">
+                      {cliCommandStatus.location}
+                    </span>
+                  ) : null}
+                </div>
+                {cliCommandStatus?.reachable_hint ? (
+                  <p className="mb-0 mt-sm text-body-sm text-on-surface-variant">
+                    {cliCommandStatus.reachable_hint}
+                  </p>
+                ) : null}
+              </div>
+            </>
+          ) : null}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function SettingsDialog({
-  folderCount,
-  hiddenTrackCount,
+  cliCommandStatus,
+  folders,
+  isInstallingCliCommand,
   onClearHiddenTracks,
   onClearQueue,
   onClose,
+  onInstallCliCommand,
+  onOpenQuickSetup,
   onThemeChange,
   onPlaybackModeChange,
   onSidebarWidthChange,
   playbackMode,
-  playlistCount,
   sidebarWidth,
   theme,
-  trackCount,
   volume,
+  volumeGain,
+  onVolumeGainChange,
+  onScanFolder,
+  onToggleFolderPinned,
+  onRelinkFolder,
+  onRelinkTrack,
+  onLibraryChanged,
+  missingTracks,
+  setMissingTracks,
+  hasCheckedHealth,
+  setHasCheckedHealth,
+  showImportHint,
+  setError,
 }: {
-  folderCount: number;
-  hiddenTrackCount: number;
+  cliCommandStatus: CliCommandStatus | null;
+  folders: Folder[];
+  isInstallingCliCommand: boolean;
   onClearHiddenTracks: () => void;
   onClearQueue: () => void;
   onClose: () => void;
+  onInstallCliCommand: () => Promise<void>;
+  onOpenQuickSetup: () => void;
   onThemeChange: (theme: AppTheme) => void;
   onPlaybackModeChange: (mode: PlaybackMode) => void;
   onSidebarWidthChange: (width: number) => void;
   playbackMode: PlaybackMode;
-  playlistCount: number;
   sidebarWidth: number;
   theme: AppTheme;
-  trackCount: number;
   volume: number;
+  volumeGain: number;
+  onVolumeGainChange: (gain: number) => Promise<void>;
+  onScanFolder: (id: number) => Promise<void>;
+  onToggleFolderPinned: (id: number) => Promise<void>;
+  onRelinkFolder: (id: number) => Promise<void>;
+  onRelinkTrack: (id: number) => Promise<void>;
+  onLibraryChanged: () => Promise<void>;
+  missingTracks: Track[];
+  setMissingTracks: (tracks: Track[]) => void;
+  hasCheckedHealth: boolean;
+  setHasCheckedHealth: (checked: boolean) => void;
+  showImportHint: (msg: string) => void;
+  setError: (err: string | null) => void;
 }) {
   const [isClosing, setIsClosing] = useState(false);
+  const [activeTab, setActiveTab] = useState<"general" | "folders" | "health">("general");
 
   function requestClose() {
     setIsClosing(true);
@@ -1215,7 +2252,7 @@ function SettingsDialog({
       <section
         aria-label="settings"
         className={[
-          "wave-dialog-panel w-[420px] max-w-[calc(100vw-32px)] border border-outline-variant bg-surface-container-low",
+          "wave-dialog-panel w-[460px] max-w-[calc(100vw-32px)] border border-outline-variant bg-surface-container-low",
           isClosing ? "wave-popover-exit" : "",
         ].join(" ")}
         onClick={(event) => event.stopPropagation()}
@@ -1234,106 +2271,339 @@ function SettingsDialog({
             <Icon name="close" size={16} />
           </button>
         </header>
-        <div className="max-h-[calc(100vh-120px)] overflow-auto p-md">
-          <div className="mb-md text-label-caps uppercase text-on-surface-variant">
-            theme
-          </div>
-          <div className="border border-outline-variant">
-            {THEME_OPTIONS.map((option) => (
-              <button
-                key={option.theme}
-                className={[
-                  "grid h-h-row w-full grid-cols-[32px_minmax(0,1fr)_64px_24px] items-center border-b border-outline-variant px-md text-left text-body-sm hover:bg-surface-container-high",
-                  option.theme === theme
-                    ? "bg-surface-variant text-primary"
-                    : "text-on-surface-variant",
-                ].join(" ")}
-                type="button"
-                onClick={() => onThemeChange(option.theme)}
-              >
-                <ThemeSwatch theme={option.theme} />
-                <span className="truncate text-on-surface">{option.label}</span>
-                <span className="text-label uppercase tracking-[0.12em]">{option.tone}</span>
-                {option.theme === theme ? <Icon name="check" size={16} /> : null}
-              </button>
-            ))}
-          </div>
-          <div className="mb-md mt-lg text-label-caps uppercase text-on-surface-variant">
-            library
-          </div>
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] border border-outline-variant text-body-sm">
-            <SettingsStat label="tracks" value={trackCount.toString()} />
-            <SettingsStat label="folders" value={folderCount.toString()} />
-            <SettingsStat label="playlists" value={playlistCount.toString()} />
-            <SettingsStat label="hidden this session" value={hiddenTrackCount.toString()} />
-          </div>
-          <div className="mb-sm mt-lg text-label-caps uppercase text-on-surface-variant">
-            layout
-          </div>
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] border border-outline-variant text-body-sm">
-            <SettingsStat label="sidebar width" value={`${sidebarWidth}px`} />
-            <div className="col-span-2 border-b border-outline-variant px-md py-sm">
-              <input
-                aria-label="sidebar width"
-                className="w-full accent-primary"
-                max={320}
-                min={180}
-                type="range"
-                value={sidebarWidth}
-                onChange={(event) => onSidebarWidthChange(Number(event.target.value))}
-              />
-              <div className="mt-xs flex items-center justify-between text-body-sm text-on-surface-variant">
-                <span>compact to roomy</span>
+
+        <div className="flex border-b border-outline-variant bg-surface-container-lowest">
+          {[
+            { id: "general", label: "general", icon: "settings" },
+            { id: "folders", label: "folders", icon: "folder" },
+            { id: "health", label: "health", icon: "healing" },
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              className={[
+                "flex-1 flex items-center justify-center gap-xs py-sm text-body-sm font-semibold border-b-2 transition-colors",
+                activeTab === tab.id
+                  ? "border-primary text-primary bg-surface-variant/20"
+                  : "border-transparent text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high/40",
+              ].join(" ")}
+              type="button"
+              onClick={() => setActiveTab(tab.id as any)}
+            >
+              <Icon name={tab.icon} size={14} />
+              <span>{tab.label}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="max-h-[calc(100vh-160px)] overflow-auto p-md">
+          {activeTab === "general" && (
+            <>
+              <div className="mb-md text-label-caps uppercase text-on-surface-variant">
+                theme
+              </div>
+              <div className="border border-outline-variant mb-lg">
+                {THEME_OPTIONS.map((option) => (
+                  <button
+                    key={option.theme}
+                    className={[
+                      "grid h-h-row w-full grid-cols-[32px_minmax(0,1fr)_64px_24px] items-center border-b border-outline-variant px-md text-left text-body-sm hover:bg-surface-container-high",
+                      option.theme === theme
+                        ? "bg-surface-variant text-primary"
+                        : "text-on-surface-variant",
+                    ].join(" ")}
+                    type="button"
+                    onClick={() => onThemeChange(option.theme)}
+                  >
+                    <ThemeSwatch theme={option.theme} />
+                    <span className="truncate text-on-surface">{option.label}</span>
+                    <span className="text-label uppercase tracking-[0.12em]">{option.tone}</span>
+                    {option.theme === theme ? <Icon name="check" size={16} /> : null}
+                  </button>
+                ))}
+              </div>
+
+              <div className="mb-sm text-label-caps uppercase text-on-surface-variant">
+                layout
+              </div>
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] border border-outline-variant text-body-sm mb-lg">
+                <SettingsStat label="sidebar width" value={`${sidebarWidth}px`} />
+                <div className="col-span-2 border-b border-outline-variant px-md py-sm">
+                  <input
+                    aria-label="sidebar width"
+                    className="w-full accent-primary"
+                    max={320}
+                    min={180}
+                    type="range"
+                    value={sidebarWidth}
+                    onChange={(event) => onSidebarWidthChange(Number(event.target.value))}
+                  />
+                  <div className="mt-xs flex items-center justify-between text-body-sm text-on-surface-variant">
+                    <span>compact to roomy</span>
+                    <button
+                      className="text-primary hover:text-on-surface"
+                      type="button"
+                      onClick={() => onSidebarWidthChange(220)}
+                    >
+                      reset
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mb-sm text-label-caps uppercase text-on-surface-variant">
+                playback & volume
+              </div>
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] border border-outline-variant text-body-sm mb-lg">
+                <SettingsStat label="mode" value={playbackMode} />
+                <div className="col-span-2 border-b border-outline-variant px-md py-sm">
+                  <div className="flex items-center justify-between gap-sm">
+                    <span className="text-on-surface-variant">default mode</span>
+                    <button
+                      className="h-h-row border border-outline-variant px-sm text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
+                      type="button"
+                      onClick={() => onPlaybackModeChange(nextPlaybackMode(playbackMode))}
+                    >
+                      cycle
+                    </button>
+                  </div>
+                </div>
+                <SettingsStat label="volume" value={`${Math.round(volume * 100)}%`} />
+              </div>
+
+              <div className="mb-sm text-label-caps uppercase text-on-surface-variant">
+                preamp volume gain
+              </div>
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] border border-outline-variant text-body-sm mb-lg">
+                <SettingsStat label="multiplier" value={`${Math.round(volumeGain * 10) / 10}x`} />
+                <div className="col-span-2 border-b border-outline-variant px-md py-sm">
+                  <input
+                    aria-label="preamp gain multiplier"
+                    className="w-full accent-primary"
+                    max={2.0}
+                    min={0.5}
+                    step={0.1}
+                    type="range"
+                    value={volumeGain}
+                    onChange={(event) => void onVolumeGainChange(Number(event.target.value))}
+                  />
+                  <div className="mt-xs flex items-center justify-between text-body-sm text-on-surface-variant">
+                    <span>0.5x (softer) to 2.0x (boosted)</span>
+                    <button
+                      className="text-primary hover:text-on-surface"
+                      type="button"
+                      onClick={() => void onVolumeGainChange(1.0)}
+                    >
+                      reset
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mb-sm text-label-caps uppercase text-on-surface-variant">
+                maintenance
+              </div>
+              <div className="grid gap-sm">
+                {!isWindowsDesktop() ? (
+                  <button
+                    className="flex min-h-[44px] items-center justify-between border border-outline-variant px-md py-sm text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface disabled:opacity-50"
+                    disabled={isInstallingCliCommand || cliCommandStatus?.installed === true}
+                    type="button"
+                    onClick={() => {
+                      void onInstallCliCommand();
+                    }}
+                  >
+                    <span>{cliCommandStatus?.installed ? "dww installed" : "install dww command"}</span>
+                    <span className="max-w-[220px] truncate text-on-surface-variant">
+                      {cliCommandStatus?.location ?? "terminal launcher"}
+                    </span>
+                  </button>
+                ) : null}
+                {!isWindowsDesktop() && cliCommandStatus?.reachable_hint ? (
+                  <div className="px-xs text-body-sm text-on-surface-variant">
+                    {cliCommandStatus.reachable_hint}
+                  </div>
+                ) : null}
                 <button
-                  className="text-primary hover:text-on-surface"
+                  className="flex h-h-row items-center justify-between border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
                   type="button"
-                  onClick={() => onSidebarWidthChange(220)}
+                  onClick={onOpenQuickSetup}
                 >
-                  reset
+                  <span>quick setup</span>
+                  <span className="text-on-surface-variant">rerun onboarding wizard</span>
+                </button>
+                <button
+                  className="flex h-h-row items-center justify-between border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
+                  type="button"
+                  onClick={onClearQueue}
+                >
+                  <span>clear queue</span>
+                  <span className="text-on-surface-variant">reset playback queue</span>
+                </button>
+                <button
+                  className="flex h-h-row items-center justify-between border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
+                  type="button"
+                  onClick={onClearHiddenTracks}
+                >
+                  <span>clear hidden</span>
+                  <span className="text-on-surface-variant">show all library tracks again</span>
                 </button>
               </div>
-            </div>
-          </div>
-          <div className="mb-sm mt-lg text-label-caps uppercase text-on-surface-variant">
-            playback
-          </div>
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] border border-outline-variant text-body-sm">
-            <SettingsStat label="mode" value={playbackMode} />
-            <div className="col-span-2 border-b border-outline-variant px-md py-sm">
-              <div className="flex items-center justify-between gap-sm">
-                <span className="text-on-surface-variant">default mode</span>
-                <button
-                  className="h-h-row border border-outline-variant px-sm text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
-                  type="button"
-                  onClick={() => onPlaybackModeChange(nextPlaybackMode(playbackMode))}
-                >
-                  cycle
-                </button>
+            </>
+          )}
+
+          {activeTab === "folders" && (
+            <div className="grid gap-sm">
+              <div className="text-body-sm text-on-surface-variant mb-xs">
+                Manage your scanned music directories:
+              </div>
+              <div className="flex flex-col gap-xs max-h-[360px] overflow-auto border border-outline-variant p-xs">
+                {folders.length === 0 ? (
+                  <div className="text-center py-md text-on-surface-variant text-body-sm">
+                    No folders added yet.
+                  </div>
+                ) : (
+                  folders.map((folder) => {
+                    const name = folder.path.split(/[\\/]/).pop() || folder.path;
+                    return (
+                      <div
+                        key={folder.id}
+                        className="flex flex-col gap-xs border border-outline-variant/50 p-sm bg-surface-container-lowest"
+                      >
+                        <div className="flex items-start justify-between min-w-0">
+                          <div className="min-w-0 pr-sm">
+                            <div className="text-body-sm font-semibold truncate text-on-surface" title={folder.path}>
+                              {name}
+                            </div>
+                            <div className="text-[10px] text-on-surface-variant truncate" title={folder.path}>
+                              {folder.path}
+                            </div>
+                            <div className="text-[10px] text-primary/80 mt-[2px] font-medium">
+                              {folder.trackCount} track(s) imported
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 gap-[4px]">
+                            <button
+                              title="Rescan Folder"
+                              className="h-[28px] w-[28px] grid place-items-center hover:bg-surface-container-high hover:text-on-surface text-on-surface-variant border border-outline-variant"
+                              type="button"
+                              onClick={() => onScanFolder(folder.id)}
+                            >
+                              <Icon name="refresh" size={14} />
+                            </button>
+                            <button
+                              title={folder.pinned ? "Unpin Folder" : "Pin Folder"}
+                              className={[
+                                "h-[28px] w-[28px] grid place-items-center border border-outline-variant",
+                                folder.pinned
+                                  ? "bg-primary/10 text-primary hover:bg-primary/20 border-primary/30"
+                                  : "text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface",
+                              ].join(" ")}
+                              type="button"
+                              onClick={() => onToggleFolderPinned(folder.id)}
+                            >
+                              <Icon name="push_pin" size={14} className={folder.pinned ? "" : "opacity-40"} />
+                            </button>
+                            <button
+                              title="Relink Path"
+                              className="h-[28px] w-[28px] grid place-items-center hover:bg-surface-container-high hover:text-on-surface text-on-surface-variant border border-outline-variant"
+                              type="button"
+                              onClick={() => onRelinkFolder(folder.id)}
+                            >
+                              <Icon name="link" size={14} />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
               </div>
             </div>
-            <SettingsStat label="volume" value={`${Math.round(volume * 100)}%`} />
-          </div>
-          <div className="mb-sm mt-lg text-label-caps uppercase text-on-surface-variant">
-            maintenance
-          </div>
-          <div className="grid gap-sm">
-            <button
-              className="flex h-h-row items-center justify-between border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
-              type="button"
-              onClick={onClearQueue}
-            >
-              <span>clear queue</span>
-              <span className="text-on-surface-variant">reset playback queue</span>
-            </button>
-            <button
-              className="flex h-h-row items-center justify-between border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
-              type="button"
-              onClick={onClearHiddenTracks}
-            >
-              <span>clear hidden</span>
-              <span className="text-on-surface-variant">show all library tracks again</span>
-            </button>
-          </div>
+          )}
+
+          {activeTab === "health" && (
+            <div className="grid gap-sm">
+              <div className="flex items-center gap-sm">
+                <button
+                  className="flex-1 h-h-row border border-primary px-sm text-body-sm text-primary hover:bg-surface-variant hover:text-on-surface"
+                  type="button"
+                  onClick={async () => {
+                    setError(null);
+                    try {
+                      const missing = await invoke<BackendTrack[]>("check_library_health");
+                      setMissingTracks(missing.map(fromBackendTrack));
+                      setHasCheckedHealth(true);
+                    } catch (err) {
+                      setError(toErrorMessage(err));
+                    }
+                  }}
+                >
+                  Run Health Check
+                </button>
+                <button
+                  className="flex-1 h-h-row border border-error px-sm text-body-sm text-error hover:bg-error/10"
+                  type="button"
+                  onClick={async () => {
+                    setError(null);
+                    try {
+                      const count = await invoke<number>("prune_missing_tracks");
+                      showImportHint(`Pruned ${count} missing track(s) from database.`);
+                      setMissingTracks([]);
+                      setHasCheckedHealth(false);
+                      await onLibraryChanged();
+                    } catch (err) {
+                      setError(toErrorMessage(err));
+                    }
+                  }}
+                >
+                  Prune All Missing
+                </button>
+              </div>
+
+              {hasCheckedHealth && (
+                <div className="mt-sm">
+                  <div className="text-body-sm font-semibold mb-xs text-on-surface">
+                    Health Check Results:
+                  </div>
+                  <div className="max-h-[220px] overflow-auto border border-outline-variant p-xs flex flex-col gap-xs">
+                    {missingTracks.length === 0 ? (
+                      <div className="text-center py-sm text-primary text-body-sm flex items-center justify-center gap-xs bg-surface-variant/20 border border-outline-variant">
+                        <Icon name="check_circle" size={16} />
+                        <span>All library files are present on disk!</span>
+                      </div>
+                    ) : (
+                      missingTracks.map((track) => (
+                        <div
+                          key={track.id}
+                          className="flex flex-col gap-xs border border-error/20 p-sm bg-error/5 text-body-sm text-on-surface"
+                        >
+                          <div className="flex items-start justify-between min-w-0">
+                            <div className="min-w-0 pr-sm">
+                              <div className="font-semibold truncate text-on-surface">
+                                {track.title || track.fileName}
+                              </div>
+                              <div className="text-[10px] text-on-surface-variant truncate" title={track.path}>
+                                {track.path}
+                              </div>
+                            </div>
+                            <button
+                              title="Relink Track File"
+                              className="h-[28px] px-xs flex items-center gap-[4px] border border-outline-variant hover:bg-surface-container-high text-body-xs font-semibold text-primary shrink-0"
+                              type="button"
+                              onClick={() => void onRelinkTrack(track.id)}
+                            >
+                              <Icon name="link" size={12} />
+                              <span>Relink</span>
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </section>
     </div>
@@ -1480,12 +2750,20 @@ function SideNav({
   onResize,
   view,
   onViewChange,
+  playlists,
+  folders,
+  onSelectPlaylist,
+  onSelectFolder,
 }: {
   collapsed: boolean;
   width: number;
   onResize: (width: number) => void;
   view: View;
   onViewChange: (view: View) => void;
+  playlists: Playlist[];
+  folders: Folder[];
+  onSelectPlaylist: (id: number) => void;
+  onSelectFolder: (id: number) => void;
 }) {
   const items = [
     {
@@ -1494,7 +2772,12 @@ function SideNav({
       view: "all-tracks" as const,
       disabled: false,
     },
-    { label: "folders", icon: "folder", view: "folders" as const, disabled: false },
+    {
+      label: "liked songs",
+      icon: "favorite",
+      view: "liked" as const,
+      disabled: false,
+    },
     { label: "albums", icon: "album", view: "albums" as const, disabled: false },
     { label: "artists", icon: "artist", view: "artists" as const, disabled: false },
     {
@@ -1504,6 +2787,9 @@ function SideNav({
       disabled: false,
     },
   ];
+
+  const pinnedPlaylists = playlists.filter((p) => p.pinned);
+  const pinnedFolders = folders.filter((f) => f.pinned);
 
   return (
     <nav
@@ -1550,6 +2836,42 @@ function SideNav({
             </span>
           </button>
         ))}
+
+        {!collapsed && (pinnedPlaylists.length > 0 || pinnedFolders.length > 0) && (
+          <div className="mt-md flex flex-col gap-xs border-t border-outline-variant/30 pt-sm">
+            <div className="px-sm text-[10px] font-bold tracking-wider text-on-surface-variant uppercase opacity-70">
+              pinned items
+            </div>
+            
+            {pinnedPlaylists.map((playlist) => (
+              <button
+                key={`pinned-pl-${playlist.id}`}
+                className="flex h-[36px] items-center gap-xs px-sm text-left text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface rounded transition-colors"
+                type="button"
+                onClick={() => onSelectPlaylist(playlist.id)}
+              >
+                <Icon name="playlist_play" size={14} className="text-primary" />
+                <span className="truncate text-body-sm font-medium">{playlist.name}</span>
+              </button>
+            ))}
+
+            {pinnedFolders.map((folder) => {
+              const name = folder.path.split(/[\\/]/).pop() || folder.path;
+              return (
+                <button
+                  key={`pinned-fld-${folder.id}`}
+                  className="flex h-[36px] items-center gap-xs px-sm text-left text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface rounded transition-colors"
+                  title={folder.path}
+                  type="button"
+                  onClick={() => onSelectFolder(folder.id)}
+                >
+                  <Icon name="folder" size={14} className="text-primary" />
+                  <span className="truncate text-body-sm font-medium">{name}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
       {!collapsed ? <ResizeRail onResize={onResize} /> : null}
     </nav>
@@ -1580,68 +2902,6 @@ function ResizeRail({ onResize }: { onResize: (width: number) => void }) {
       role="separator"
       onPointerDown={startResize}
     />
-  );
-}
-
-function FoldersView({
-  error,
-  folders,
-  isScanning,
-  scanSummary,
-  onRescanLibrary,
-}: {
-  error: string | null;
-  folders: Folder[];
-  isScanning: boolean;
-  scanSummary: string | null;
-  onRescanLibrary: () => void;
-}) {
-  return (
-    <div className="flex min-h-0 flex-1 flex-col" data-drop-target="all-tracks">
-      <header className="flex h-h-bar shrink-0 items-center border-b border-surface-container-high px-lg">
-        <h1 className="m-0 text-headline font-semibold text-on-surface">folders</h1>
-        <span className="ml-sm text-body-sm text-on-surface-variant">
-          {folders.length} folders
-        </span>
-        <div className="flex-1" />
-        <button
-          className="h-h-row border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
-          disabled={isScanning || folders.length === 0}
-          type="button"
-          onClick={onRescanLibrary}
-        >
-          {isScanning ? "scanning..." : "rescan"}
-        </button>
-      </header>
-      {folders.length === 0 ? (
-        <div className="flex flex-1 flex-col justify-center px-xl">
-          <p className="m-0 text-body-md text-on-surface-variant">no folders yet.</p>
-          <p className="mb-0 mt-xs text-body-md text-on-surface-variant">
-            add a folder from all tracks.
-          </p>
-        </div>
-      ) : (
-        <div className="min-h-0 flex-1 overflow-auto">
-          {folders.map((folder) => (
-            <div
-              key={folder.id}
-              className="grid h-h-row grid-cols-[minmax(0,1fr)_96px] items-center border-l-2 border-transparent px-md text-body-md text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
-            >
-              <span className="truncate text-on-surface">{folder.path}</span>
-              <span className="tabular text-right text-body-sm text-on-surface-variant">
-                {folder.trackCount} tracks
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-      {error ? <p className="mb-md mt-sm px-lg text-body-sm text-error">{error}</p> : null}
-      {scanSummary ? (
-        <p className="mb-md mt-sm px-lg text-body-sm text-on-surface-variant">
-          {scanSummary}
-        </p>
-      ) : null}
-    </div>
   );
 }
 
@@ -2237,50 +3497,74 @@ function EntityDetail({
 function QueuePanel({
   currentTrackId,
   open,
-  queuedTrackIds,
+  queuedTracks,
   tracks,
   shuffledTrackIds,
   playbackMode,
   onClose,
   onTrackContextMenu,
   onPlayTrack,
+  onPlayQueueItem,
+  onRemoveQueueItem,
+  onReorderQueue,
+  onRemoveFromShuffleDeck,
+  onClearQueue,
   isPaused,
 }: {
   currentTrackId: number | null;
   open: boolean;
-  queuedTrackIds: number[];
+  queuedTracks: QueueItem[];
   tracks: Track[];
   shuffledTrackIds: number[];
   playbackMode: PlaybackMode;
   onClose: () => void;
   onTrackContextMenu: (trackId: number, x: number, y: number) => void;
   onPlayTrack: (trackId: number) => void;
+  onPlayQueueItem: (queueItemId: string) => void;
+  onRemoveQueueItem: (queueItemId: string) => void;
+  onReorderQueue: (fromIndex: number, toIndex: number) => void;
+  onRemoveFromShuffleDeck?: (trackId: number) => void;
+  onClearQueue: () => void;
   isPaused: boolean;
 }) {
   const trackById = useMemo(() => new Map(tracks.map((t) => [t.id, t])), [tracks]);
-  const currentIndex = tracks.findIndex((track) => track.id === currentTrackId);
-  const queuedTracks = queuedTrackIds
-    .map((trackId) => trackById.get(trackId))
-    .filter((track): track is Track => track !== undefined);
-  const queueTracks =
-    queuedTracks.length > 0
-      ? [
-          ...(currentTrackId
-            ? tracks.filter((track) => track.id === currentTrackId).slice(0, 1)
-            : []),
-          ...queuedTracks,
-        ]
-      : playbackMode === "shuffle" && shuffledTrackIds.length > 0
-        ? shuffledTrackIds
-            .map((id) => trackById.get(id))
-            .filter((track): track is Track => track !== undefined)
-            .slice(shuffledTrackIds.indexOf(currentTrackId ?? -1) !== -1 ? shuffledTrackIds.indexOf(currentTrackId ?? -1) : 0)
-        : currentIndex >= 0
-          ? tracks.slice(currentIndex)
-          : tracks.slice(0, 20);
+
+  const queuedTracksMapped = useMemo(() => {
+    return queuedTracks
+      .map((item) => {
+        const track = trackById.get(item.trackId);
+        return track ? { ...track, queueItemId: item.id } : null;
+      })
+      .filter((track): track is Track & { queueItemId: string } => track !== null);
+  }, [queuedTracks, trackById]);
+
+  const upcomingTracks = useMemo(() => {
+    const explicit = queuedTracksMapped;
+
+    // Fallback: tracks from library (shuffled or sequential)
+    let sourceFallback: Track[] = [];
+    if (playbackMode === "shuffle" && shuffledTrackIds.length > 0) {
+      const idx = shuffledTrackIds.indexOf(currentTrackId ?? -1);
+      const startIdx = idx !== -1 ? idx + 1 : 0;
+      sourceFallback = shuffledTrackIds
+        .slice(startIdx)
+        .map((id) => trackById.get(id))
+        .filter((track): track is Track => track !== undefined);
+    } else {
+      const idx = tracks.findIndex((t) => t.id === currentTrackId);
+      const startIdx = idx !== -1 ? idx + 1 : 0;
+      sourceFallback = tracks.slice(startIdx, startIdx + 50);
+    }
+
+    const fallbackMapped = sourceFallback.map((t) => ({
+      ...t,
+      queueItemId: `fallback-${t.id}`,
+    }));
+
+    return [...explicit, ...fallbackMapped];
+  }, [queuedTracksMapped, playbackMode, shuffledTrackIds, currentTrackId, trackById, tracks]);
 
   const nowPlayingTrack = currentTrackId != null ? trackById.get(currentTrackId) : undefined;
-  const upcomingTracks = queueTracks.filter((t) => t.id !== currentTrackId);
 
   return (
     <div
@@ -2302,9 +3586,18 @@ function QueuePanel({
           open ? "w-w-nav opacity-100" : "w-0 opacity-0",
         ].join(" ")}
       >
-        <header className="wave-panel-content flex h-h-bar min-w-w-nav items-center border-b border-surface-container-high px-md">
+        <header className="wave-panel-content flex h-h-bar min-w-w-nav items-center border-b border-surface-container-high px-md gap-sm">
           <h2 className="m-0 text-headline font-semibold text-on-surface">queue</h2>
           <div className="flex-1" />
+          {queuedTracks.length > 0 && (
+            <button
+              className="px-sm py-xs text-[10px] font-semibold uppercase tracking-[0.05em] text-on-surface-variant hover:text-error hover:bg-error/10 transition-colors"
+              type="button"
+              onClick={onClearQueue}
+            >
+              clear all
+            </button>
+          )}
           <button
             aria-label="close queue"
             className="grid h-h-row w-h-row place-items-center text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
@@ -2351,29 +3644,116 @@ function QueuePanel({
             </p>
           ) : (
             <div className="flex flex-col gap-[2px]">
-              {upcomingTracks.map((track, idx) => (
-                <button
-                  key={track.id}
-                  className="group grid h-h-row w-full grid-cols-[24px_minmax(0,1fr)_48px] items-center border-l-2 border-transparent px-sm text-left text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface transition-colors duration-150"
-                  type="button"
-                  onContextMenu={(event) => {
-                    event.preventDefault();
-                    onTrackContextMenu(track.id, event.clientX, event.clientY);
-                  }}
-                  onDoubleClick={() => onPlayTrack(track.id)}
-                >
-                  <span className="text-[11px] tabular text-on-surface-variant/50 group-hover:hidden">
-                    {idx + 1}
-                  </span>
-                  <span className="hidden text-primary group-hover:flex items-center">
-                    <Icon name="play_arrow" size={14} />
-                  </span>
-                  <span className="truncate text-on-surface pr-sm">{track.title || track.fileName}</span>
-                  <span className="tabular text-right text-[11px] text-on-surface-variant/50">
-                    {formatDuration(track.durationSeconds)}
-                  </span>
-                </button>
-              ))}
+              {upcomingTracks.map((track, idx) => {
+                const isExplicit = !track.queueItemId.startsWith("fallback-");
+                const isShuffleFallback = playbackMode === "shuffle" && !isExplicit;
+                return (
+                  <div
+                    key={track.queueItemId}
+                    className="group grid h-h-row w-full grid-cols-[24px_minmax(0,1fr)_96px] items-center border-l-2 border-transparent px-sm text-left text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface transition-all duration-150"
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      onTrackContextMenu(track.id, event.clientX, event.clientY);
+                    }}
+                    onDoubleClick={() => {
+                      if (isExplicit) {
+                        onPlayQueueItem(track.queueItemId);
+                      } else {
+                        onPlayTrack(track.id);
+                      }
+                    }}
+                  >
+                    <button
+                      type="button"
+                      className="h-full w-full flex items-center justify-start text-[11px] tabular text-on-surface-variant/50 group-hover:hidden"
+                      onClick={() => {
+                        if (isExplicit) {
+                          onPlayQueueItem(track.queueItemId);
+                        } else {
+                          onPlayTrack(track.id);
+                        }
+                      }}
+                    >
+                      {idx + 1}
+                    </button>
+                    <button
+                      type="button"
+                      className="hidden text-primary group-hover:flex items-center h-full w-full justify-start"
+                      onClick={() => {
+                        if (isExplicit) {
+                          onPlayQueueItem(track.queueItemId);
+                        } else {
+                          onPlayTrack(track.id);
+                        }
+                      }}
+                    >
+                      <Icon name="play_arrow" size={14} />
+                    </button>
+                    <div className="truncate text-on-surface pr-sm font-medium">
+                      {track.title || track.fileName}
+                    </div>
+                    <div className="h-full flex items-center justify-end">
+                      {isExplicit || isShuffleFallback ? (
+                        <>
+                          <span className="tabular text-right text-[11px] text-on-surface-variant/50 group-hover:hidden">
+                            {formatDuration(track.durationSeconds)}
+                          </span>
+                          <div className="hidden group-hover:flex items-center gap-[4px]">
+                            {/* Move Up */}
+                            {idx > 0 && (
+                              <button
+                                type="button"
+                                aria-label="Move up"
+                                className="h-6 w-6 flex items-center justify-center rounded-full text-on-surface-variant hover:text-primary hover:bg-surface-variant transition-colors"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onReorderQueue(idx, idx - 1);
+                                }}
+                              >
+                                <Icon name="keyboard_arrow_up" size={16} />
+                              </button>
+                            )}
+                            {/* Move Down */}
+                            {idx < upcomingTracks.length - 1 && (
+                              <button
+                                type="button"
+                                aria-label="Move down"
+                                className="h-6 w-6 flex items-center justify-center rounded-full text-on-surface-variant hover:text-primary hover:bg-surface-variant transition-colors"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onReorderQueue(idx, idx + 1);
+                                }}
+                              >
+                                <Icon name="keyboard_arrow_down" size={16} />
+                              </button>
+                            )}
+                            {/* Remove */}
+                            <button
+                              type="button"
+                              aria-label="Remove from queue"
+                              className="h-6 w-6 flex items-center justify-center rounded-full text-on-surface-variant hover:text-error hover:bg-error/10 transition-colors"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (isExplicit) {
+                                  onRemoveQueueItem(track.queueItemId);
+                                } else {
+                                  onRemoveFromShuffleDeck?.(track.id);
+                                }
+                              }}
+                            >
+                              <Icon name="close" size={14} />
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <span className="tabular text-right text-[11px] text-on-surface-variant/50">
+                          {formatDuration(track.durationSeconds)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -2473,6 +3853,8 @@ function TrackMetadataDialog({
     title: track?.title ?? "",
     artist: track?.artist ?? "",
     album: track?.album ?? "",
+    genre: track?.genreOverride ?? track?.genre ?? "",
+    year: (track?.yearOverride ?? track?.year ?? "").toString(),
   }));
 
   useEffect(() => {
@@ -2480,6 +3862,8 @@ function TrackMetadataDialog({
       title: track?.title ?? "",
       artist: track?.artist ?? "",
       album: track?.album ?? "",
+      genre: track?.genreOverride ?? track?.genre ?? "",
+      year: (track?.yearOverride ?? track?.year ?? "").toString(),
     });
   }, [track]);
 
@@ -2541,6 +3925,18 @@ function TrackMetadataDialog({
             value={draft.album}
             onChange={(event) => setDraft((current) => ({ ...current, album: event.target.value }))}
           />
+          <input
+            className="h-h-row w-full border border-outline-variant bg-surface-container-lowest px-md text-body-sm text-on-surface placeholder:text-on-surface-variant"
+            placeholder="genre"
+            value={draft.genre}
+            onChange={(event) => setDraft((current) => ({ ...current, genre: event.target.value }))}
+          />
+          <input
+            className="h-h-row w-full border border-outline-variant bg-surface-container-lowest px-md text-body-sm text-on-surface placeholder:text-on-surface-variant"
+            placeholder="year"
+            value={draft.year}
+            onChange={(event) => setDraft((current) => ({ ...current, year: event.target.value }))}
+          />
         </div>
         <div className="mt-md flex justify-end gap-sm">
           <button
@@ -2567,6 +3963,7 @@ function AllTracksView({
   folderPath,
   onFolderPathChange,
   onAddFolder,
+  onOpenFolderPicker,
   searchInputRef,
   selectedTrackId,
   onSelectTrack,
@@ -2579,14 +3976,23 @@ function AllTracksView({
   scanSummary,
   onAddTrackToPlaylist,
   onAddToQueue,
+  onPlayNext,
   onCreatePlaylistForTrack,
   onEditTrackMetadata,
   onHideTrack,
+  onToggleLiked,
+  isLikedView = false,
+  filterFolderId = null,
+  onClearFolderFilter,
+  folders = [],
+  scanProgress = null,
+  onCancelScan,
   isPaused,
 }: {
   folderPath: string;
   onFolderPathChange: (value: string) => void;
-  onAddFolder: () => void;
+  onAddFolder: () => Promise<boolean>;
+  onOpenFolderPicker: () => Promise<boolean>;
   searchInputRef: RefObject<HTMLInputElement>;
   selectedTrackId: number | null;
   onSelectTrack: (id: number) => void;
@@ -2599,11 +4005,21 @@ function AllTracksView({
   scanSummary: string | null;
   onAddTrackToPlaylist: (trackId: number, playlistId: number) => Promise<void>;
   onAddToQueue: (trackId: number) => void;
+  onPlayNext: (trackId: number) => void;
   onCreatePlaylistForTrack: (trackId: number, initialName: string) => void;
   onEditTrackMetadata: (trackId: number) => void;
   onHideTrack: (trackId: number) => void;
+  onToggleLiked: (trackId: number) => void;
+  isLikedView?: boolean;
+  filterFolderId?: number | null;
+  onClearFolderFilter?: () => void;
+  folders?: Folder[];
+  scanProgress?: { scanned: number; added: number; currentFile: string } | null;
+  onCancelScan?: () => void;
   isPaused: boolean;
 }) {
+  const windowWidth = useWindowWidth();
+  const isWideEnough = windowWidth >= 1280;
   const [trackQuery, setTrackQuery] = useState("");
   const [browseMode, setBrowseMode] = useState<TrackBrowseMode>("all");
   const [sortKey, setSortKey] = useState<TrackSortKey>("title");
@@ -2624,12 +4040,34 @@ function AllTracksView({
     setSortDirection("asc");
   };
 
+  const currentFolder = filterFolderId ? folders.find((f) => f.id === filterFolderId) : null;
+  const folderName = currentFolder ? currentFolder.path.split(/[\\/]/).pop() || currentFolder.path : "";
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="flex min-h-[64px] shrink-0 items-center gap-md border-b border-surface-container-high px-lg py-sm">
-        <h1 className="m-0 min-w-[120px] text-headline font-semibold text-on-surface">all tracks</h1>
-        <div className="min-w-[220px] max-w-[640px] flex-1">
-            <input
+        <div className="flex flex-col gap-xs min-w-[120px]">
+          <h1 className="m-0 text-headline font-semibold text-on-surface">
+            {isLikedView ? "liked songs" : "all tracks"}
+          </h1>
+          {filterFolderId && currentFolder && onClearFolderFilter && (
+            <div className="flex items-center gap-xs rounded-full bg-primary/10 border border-primary/20 px-xs py-[2px] text-body-xs text-primary self-start mt-xxs">
+              <Icon name="folder" size={12} />
+              <span className="max-w-[100px] truncate" title={currentFolder.path}>
+                {folderName}
+              </span>
+              <button
+                className="hover:bg-primary/20 rounded-full p-[2px] flex items-center justify-center transition-colors"
+                type="button"
+                onClick={onClearFolderFilter}
+              >
+                <Icon name="close" size={12} />
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="min-w-[180px] max-w-[640px] flex-1">
+          <input
             ref={searchInputRef}
             className="h-[40px] w-full border border-outline-variant bg-surface-container-low px-md text-body-md text-on-surface placeholder:text-on-surface-variant focus:border-primary focus:outline-none"
             placeholder="search tracks..."
@@ -2638,10 +4076,25 @@ function AllTracksView({
           />
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-xs">
+          {!isLikedView && (
+            <button
+              className="h-h-row border border-outline-variant px-sm text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
+              type="button"
+              onClick={onOpenFolderPicker}
+            >
+              + folder
+            </button>
+          )}
           {[
             { key: "all", label: "all" },
             { key: "recent-added", label: "recent added" },
             { key: "recent-played", label: "recent played" },
+            ...(isWideEnough
+              ? [
+                  { key: "most-played", label: "most played" },
+                  { key: "never-played", label: "never played" },
+                ]
+              : []),
           ].map((item) => (
             <button
               key={item.key}
@@ -2660,16 +4113,48 @@ function AllTracksView({
         </div>
       </header>
       {tracks.length === 0 ? (
-        <EmptyTracksState
-          folderPath={folderPath}
-          onFolderPathChange={onFolderPathChange}
-          onAddFolder={onAddFolder}
-          error={error}
-          isScanning={isScanning}
-          scanSummary={scanSummary}
-        />
+        isLikedView ? (
+          <div className="flex flex-1 flex-col items-center justify-center gap-md text-center select-none py-2xl">
+            <span className="material-symbols-outlined text-[48px] text-on-surface-variant/20">favorite</span>
+            <div>
+              <p className="m-0 text-body-md font-semibold text-on-surface-variant">No liked songs yet</p>
+              <p className="m-0 mt-xs text-body-sm text-on-surface-variant/50">Press the heart icon on any track to save it here</p>
+            </div>
+          </div>
+        ) : (
+          <EmptyTracksState
+            folderPath={folderPath}
+            onFolderPathChange={onFolderPathChange}
+            onAddFolder={onAddFolder}
+            onOpenFolderPicker={onOpenFolderPicker}
+            error={error}
+            isScanning={isScanning}
+            scanSummary={scanSummary}
+            scanProgress={scanProgress}
+            onCancelScan={onCancelScan}
+          />
+        )
       ) : (
         <>
+          {scanProgress && onCancelScan && (
+            <div className="flex items-center justify-between gap-md border-b border-outline-variant bg-surface-container-low px-lg py-sm text-body-sm text-on-surface-variant">
+              <div className="flex min-w-0 flex-1 items-center gap-sm">
+                <span className="font-semibold text-primary">SCANNING</span>
+                <span className="truncate">
+                  {scanProgress.scanned} files scanned ({scanProgress.added} added)
+                  {scanProgress.currentFile ? ` - ${scanProgress.currentFile}` : ""}
+                </span>
+              </div>
+              <button
+                className="flex h-[28px] shrink-0 items-center gap-xs border border-error px-sm text-[11px] font-medium text-error hover:bg-error/10 transition-colors"
+                type="button"
+                onClick={onCancelScan}
+              >
+                <Icon name="close" size={14} />
+                <span>Cancel</span>
+              </button>
+            </div>
+          )}
           {error ? (
             <div className="border-b border-surface-container-high px-lg py-sm">
               <p className="m-0 text-body-sm text-error">{error}</p>
@@ -2683,9 +4168,11 @@ function AllTracksView({
             onSelectTrack={onSelectTrack}
             onAddTrackToPlaylist={onAddTrackToPlaylist}
             onAddToQueue={onAddToQueue}
+            onPlayNext={onPlayNext}
             onCreatePlaylistForTrack={onCreatePlaylistForTrack}
             onEditTrackMetadata={onEditTrackMetadata}
             onHideTrack={onHideTrack}
+            onToggleLiked={onToggleLiked}
             sortDirection={sortDirection}
             sortKey={sortKey}
             tracks={sortedTracks}
@@ -2702,16 +4189,22 @@ function EmptyTracksState({
   folderPath,
   onFolderPathChange,
   onAddFolder,
+  onOpenFolderPicker,
   error,
   isScanning,
   scanSummary,
+  scanProgress = null,
+  onCancelScan,
 }: {
   folderPath: string;
   onFolderPathChange: (value: string) => void;
-  onAddFolder: () => void;
+  onAddFolder: () => Promise<boolean>;
+  onOpenFolderPicker: () => Promise<boolean>;
   error: string | null;
   isScanning: boolean;
   scanSummary: string | null;
+  scanProgress?: { scanned: number; added: number; currentFile: string } | null;
+  onCancelScan?: () => void;
 }) {
   return (
     <div className="flex flex-1 flex-col justify-center px-xl">
@@ -2724,8 +4217,11 @@ function EmptyTracksState({
         folderPath={folderPath}
         isScanning={isScanning}
         scanSummary={scanSummary}
+        scanProgress={scanProgress}
+        onCancelScan={onCancelScan}
         onAddFolder={onAddFolder}
         onFolderPathChange={onFolderPathChange}
+        onOpenFolderPicker={onOpenFolderPicker}
       />
     </div>
   );
@@ -2736,43 +4232,71 @@ function AddFolderPanel({
   folderPath,
   isScanning,
   scanSummary,
+  scanProgress = null,
+  onCancelScan,
   onAddFolder,
   onFolderPathChange,
+  onOpenFolderPicker,
 }: {
   error: string | null;
   folderPath: string;
   isScanning: boolean;
   scanSummary: string | null;
-  onAddFolder: () => void;
+  scanProgress?: { scanned: number; added: number; currentFile: string } | null;
+  onCancelScan?: () => void;
+  onAddFolder: () => Promise<boolean>;
   onFolderPathChange: (value: string) => void;
+  onOpenFolderPicker: () => Promise<boolean>;
 }) {
   return (
     <div>
+      <div className="mb-sm flex items-center gap-sm">
+        {isScanning && onCancelScan ? (
+          <div className="flex items-center gap-sm">
+            <span className="flex h-h-row items-center px-md text-body-sm text-on-surface-variant animate-pulse">
+              scanning... {scanProgress ? `(${scanProgress.scanned} scanned / ${scanProgress.added} added)` : ""}
+            </span>
+            <button
+              className="flex h-[28px] shrink-0 items-center gap-xs border border-error px-sm text-[11px] font-medium text-error hover:bg-error/10 transition-colors"
+              type="button"
+              onClick={onCancelScan}
+            >
+              <Icon name="close" size={14} />
+              <span>Cancel</span>
+            </button>
+          </div>
+        ) : (
+          <button
+            className="h-h-row border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
+            type="button"
+            onClick={() => {
+              void onOpenFolderPicker();
+            }}
+          >
+            choose folder
+          </button>
+        )}
+      </div>
       <form
         className="flex gap-sm"
         onSubmit={(event) => {
           event.preventDefault();
-          onAddFolder();
+          void onAddFolder();
         }}
       >
         <input
           className="h-h-row min-w-0 flex-1 border border-outline-variant bg-surface-container-low px-md text-body-sm text-on-surface placeholder:text-on-surface-variant"
-          placeholder="paste a folder path..."
+          placeholder="manual path fallback..."
           value={folderPath}
           onChange={(event) => onFolderPathChange(event.target.value)}
         />
-        {isScanning ? (
-          <span className="flex h-h-row items-center px-md text-body-sm text-on-surface-variant">
-            scanning...
-          </span>
-        ) : (
-          <button
-            className="h-h-row border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
-            type="submit"
-          >
-            add
-          </button>
-        )}
+        <button
+          className="h-h-row border border-outline-variant px-md text-body-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface disabled:opacity-50"
+          disabled={isScanning}
+          type="submit"
+        >
+          add
+        </button>
       </form>
       {error ? <p className="mb-0 mt-sm text-body-sm text-error">{error}</p> : null}
       {scanSummary ? (
@@ -2790,9 +4314,11 @@ function TrackList({
   onSelectTrack,
   onAddTrackToPlaylist,
   onAddToQueue,
+  onPlayNext,
   onCreatePlaylistForTrack,
   onEditTrackMetadata,
   onHideTrack,
+  onToggleLiked,
   onSortChange,
   sortDirection,
   sortKey,
@@ -2806,9 +4332,11 @@ function TrackList({
   onSelectTrack: (id: number) => void;
   onAddTrackToPlaylist: (trackId: number, playlistId: number) => Promise<void>;
   onAddToQueue: (trackId: number) => void;
+  onPlayNext: (trackId: number) => void;
   onCreatePlaylistForTrack: (trackId: number, initialName: string) => void;
   onEditTrackMetadata: (trackId: number) => void;
   onHideTrack: (trackId: number) => void;
+  onToggleLiked: (trackId: number) => void;
   onSortChange: (sortKey: TrackSortKey) => void;
   sortDirection: SortDirection;
   sortKey: TrackSortKey;
@@ -2866,45 +4394,50 @@ function TrackList({
           onClick={closeMenu}
         />
       ) : null}
-        {contextMenu ? (
-            <TrackContextMenu
-              menu={contextMenu}
-              playlists={playlists}
-              track={tracks.find((track) => track.id === contextMenu.trackId)}
-            onAddToPlaylist={async (playlistId) => {
-              await onAddTrackToPlaylist(contextMenu.trackId, playlistId);
-              setContextMenu(null);
-            }}
-            onAddToQueue={() => {
-              onAddToQueue(contextMenu.trackId);
-              setContextMenu(null);
-            }}
-            onClose={() => setContextMenu(null)}
-            onCreatePlaylist={(initialName) => {
-              onCreatePlaylistForTrack(contextMenu.trackId, initialName);
-              setContextMenu(null);
-            }}
-            onEditMetadata={() => {
-              onEditTrackMetadata(contextMenu.trackId);
-              setContextMenu(null);
-            }}
-            onHideTrack={() => {
-              onHideTrack(contextMenu.trackId);
-              setContextMenu(null);
-            }}
-            onPlay={() => {
-              void onPlayTrack(contextMenu.trackId);
-              setContextMenu(null);
-            }}
-          />
-        ) : null}
-      <div className="sticky top-0 z-10 grid h-h-row w-full select-none grid-cols-[minmax(0,1fr)_minmax(120px,25%)_minmax(120px,25%)_64px_32px] items-center border-b border-surface-container-high bg-surface px-md text-label uppercase tracking-[0.16em] text-on-surface-variant">
+      {contextMenu ? (
+        <TrackContextMenu
+          menu={contextMenu}
+          playlists={playlists}
+          track={tracks.find((track) => track.id === contextMenu.trackId)}
+          onAddToPlaylist={async (playlistId) => {
+            await onAddTrackToPlaylist(contextMenu.trackId, playlistId);
+            setContextMenu(null);
+          }}
+          onAddToQueue={() => {
+            onAddToQueue(contextMenu.trackId);
+            setContextMenu(null);
+          }}
+          onPlayNext={() => {
+            onPlayNext(contextMenu.trackId);
+            setContextMenu(null);
+          }}
+          onClose={() => setContextMenu(null)}
+          onCreatePlaylist={(initialName) => {
+            onCreatePlaylistForTrack(contextMenu.trackId, initialName);
+            setContextMenu(null);
+          }}
+          onEditMetadata={() => {
+            onEditTrackMetadata(contextMenu.trackId);
+            setContextMenu(null);
+          }}
+          onHideTrack={() => {
+            onHideTrack(contextMenu.trackId);
+            setContextMenu(null);
+          }}
+          onPlay={() => {
+            void onPlayTrack(contextMenu.trackId);
+            setContextMenu(null);
+          }}
+        />
+      ) : null}
+      <div className="sticky top-0 z-10 grid h-h-row w-full select-none grid-cols-[minmax(0,1fr)_36px_minmax(100px,20%)_minmax(100px,20%)_64px_32px] items-center border-b border-surface-container-high bg-surface px-md text-label uppercase tracking-[0.16em] text-on-surface-variant">
         <SortHeaderButton
           active={sortKey === "title"}
           direction={sortDirection}
           label="title"
           onClick={() => onSortChange("title")}
         />
+        <span />
         <SortHeaderButton
           active={sortKey === "artist"}
           className="px-sm"
@@ -2919,6 +4452,7 @@ function TrackList({
           label="album"
           onClick={() => onSortChange("album")}
         />
+
         <SortHeaderButton
           active={sortKey === "duration"}
           className="justify-end text-right"
@@ -2935,7 +4469,7 @@ function TrackList({
           <div
             key={track.id}
             className={[
-              "relative grid h-h-row w-full select-none grid-cols-[minmax(0,1fr)_minmax(120px,25%)_minmax(120px,25%)_64px_32px] items-center border-l-2 px-md text-left text-body-md transition-colors duration-150",
+              "relative grid h-h-row w-full select-none grid-cols-[minmax(0,1fr)_36px_minmax(100px,20%)_minmax(100px,20%)_64px_32px] items-center border-l-2 px-md text-left text-body-md transition-colors duration-150",
               selected
                 ? "border-primary bg-surface-variant text-primary"
                 : playing
@@ -2960,12 +4494,28 @@ function TrackList({
               {playing ? <PlayingEqualizer isPaused={isPaused} /> : null}
               <span className={playing ? "truncate text-primary" : "truncate"}>{track.title || track.fileName}</span>
             </span>
+            <button
+              aria-label={track.liked ? "unlike track" : "like track"}
+              className="grid h-h-row w-h-row place-items-center text-on-surface-variant hover:text-primary transition-colors"
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggleLiked(track.id);
+              }}
+            >
+              <Icon
+                name={track.liked ? "favorite" : "favorite_border"}
+                size={16}
+                className={track.liked ? "text-primary" : "opacity-40"}
+              />
+            </button>
             <span className="truncate px-sm text-on-surface-variant">
               {track.artist ?? "-"}
             </span>
             <span className="truncate px-sm text-on-surface-variant">
               {track.album ?? "-"}
             </span>
+
             <span className="tabular text-right text-body-sm text-on-surface-variant">
               {formatDuration(track.durationSeconds)}
             </span>
@@ -3052,6 +4602,7 @@ function TrackContextMenu({
   track,
   onAddToPlaylist,
   onAddToQueue,
+  onPlayNext,
   onClose,
   onCreatePlaylist,
   onEditMetadata,
@@ -3063,6 +4614,7 @@ function TrackContextMenu({
   track?: Track;
   onAddToPlaylist: (playlistId: number) => Promise<void>;
   onAddToQueue: () => void;
+  onPlayNext: () => void;
   onClose: () => void;
   onCreatePlaylist: (initialName: string) => void;
   onEditMetadata: () => void;
@@ -3104,6 +4656,14 @@ function TrackContextMenu({
         >
           <Icon name="play_arrow" size={16} />
           <span>play</span>
+        </button>
+        <button
+          className="grid h-h-row w-full grid-cols-[24px_minmax(0,1fr)] items-center px-md text-left hover:bg-surface-container-high hover:text-on-surface"
+          type="button"
+          onClick={onPlayNext}
+        >
+          <Icon name="queue_music" size={16} />
+          <span>play next</span>
         </button>
         <button
           className="grid h-h-row w-full grid-cols-[24px_minmax(0,1fr)] items-center px-md text-left hover:bg-surface-container-high hover:text-on-surface"
@@ -3251,7 +4811,7 @@ function NowPlayingBar({
   isPaused,
   playbackMode,
   volume,
-  elapsedMs,
+  authoritativeElapsedMs,
   onNext,
   onPlaybackModeChange,
   onPrevious,
@@ -3266,7 +4826,7 @@ function NowPlayingBar({
   isPaused: boolean;
   playbackMode: PlaybackMode;
   volume: number;
-  elapsedMs: number;
+  authoritativeElapsedMs: number;
   onNext: () => void;
   onPlaybackModeChange: (mode: PlaybackMode) => void;
   onPrevious: () => void;
@@ -3279,17 +4839,41 @@ function NowPlayingBar({
   const hasTrack = currentTrack !== undefined;
   const durationSeconds = currentTrack?.durationSeconds ?? playbackDurationSeconds;
   const volumePercent = Math.round(volume * 100);
-  const displayElapsedMs =
+  const [displayElapsedMs, setDisplayElapsedMs] = useState(authoritativeElapsedMs);
+  const clampedElapsedMs =
     durationSeconds && durationSeconds > 0
-      ? Math.min(elapsedMs, durationSeconds * 1000)
-      : elapsedMs;
-  const elapsedSeconds = displayElapsedMs / 1000;
+      ? Math.min(displayElapsedMs, durationSeconds * 1000)
+      : displayElapsedMs;
+  const elapsedSeconds = clampedElapsedMs / 1000;
   const elapsedPercent =
     durationSeconds && durationSeconds > 0
       ? Math.min(100, (elapsedSeconds / durationSeconds) * 100)
       : 0;
   const progressScale = String(clampPercent(elapsedPercent) / 100);
   const [isUserSeeking, setIsUserSeeking] = useState(false);
+
+  useEffect(() => {
+    setDisplayElapsedMs(authoritativeElapsedMs);
+  }, [authoritativeElapsedMs, currentTrack?.id]);
+
+  useEffect(() => {
+    if (isPaused || !hasTrack || isUserSeeking) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setDisplayElapsedMs((current) => {
+        const next = current + 100;
+        return durationSeconds && durationSeconds > 0
+          ? Math.min(next, durationSeconds * 1000)
+          : next;
+      });
+    }, 100);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [durationSeconds, hasTrack, isPaused, isUserSeeking]);
 
   return (
     <footer className="relative h-h-now shrink-0 border-t border-surface-container-high bg-surface-container-low overflow-hidden">
@@ -3308,7 +4892,9 @@ function NowPlayingBar({
         aria-valuenow={Math.round(elapsedPercent)}
         onClick={(event) => {
           if (!durationSeconds) return;
-          onSeek(readPointerRatio(event) * durationSeconds * 1000);
+          const nextElapsedMs = readPointerRatio(event) * durationSeconds * 1000;
+          setDisplayElapsedMs(nextElapsedMs);
+          onSeek(nextElapsedMs);
         }}
         onPointerDown={() => setIsUserSeeking(true)}
         onPointerUp={() => setIsUserSeeking(false)}
@@ -3493,6 +5079,13 @@ function fromBackendTrack(track: BackendTrack): Track {
     createdAt: track.created_at,
     lastPlayedAt: track.last_played_at ?? undefined,
     fileName: track.file_name,
+    liked: track.liked,
+    playCount: track.play_count,
+    genre: track.genre ?? undefined,
+    year: track.year ?? undefined,
+    genreOverride: track.genre_override ?? undefined,
+    yearOverride: track.year_override ?? undefined,
+    lastPositionMs: track.last_position_ms,
   };
 }
 
@@ -3500,6 +5093,7 @@ function fromBackendFolders(backendFolders: BackendFolder[], tracks: Track[]): F
   return backendFolders.map((folder) => ({
     id: folder.id,
     path: folder.path,
+    pinned: folder.pinned,
     trackCount: tracks.filter((track) => track.folderId === folder.id).length,
   }));
 }
@@ -3518,6 +5112,7 @@ function fromBackendPlaylists(
       name: playlist.name,
       trackCount: playlistTracks.length,
       tracks: playlistTracks,
+      pinned: playlist.pinned,
     };
   });
 }
@@ -3702,14 +5297,61 @@ function readStoredPlaybackMode(): PlaybackMode {
   return "normal";
 }
 
-function readStoredQueue(): number[] {
+function readStoredWindowState(): StoredWindowState | null {
+  const raw = window.localStorage.getItem(WINDOW_STATE_STORAGE_KEY);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<StoredWindowState>;
+    if (
+      typeof parsed.width !== "number" ||
+      typeof parsed.height !== "number" ||
+      typeof parsed.x !== "number" ||
+      typeof parsed.y !== "number" ||
+      typeof parsed.isMaximized !== "boolean"
+    ) {
+      return null;
+    }
+
+    if (parsed.width < 720 || parsed.height < 480) {
+      return null;
+    }
+
+    return {
+      width: Math.round(parsed.width),
+      height: Math.round(parsed.height),
+      x: Math.round(parsed.x),
+      y: Math.round(parsed.y),
+      isMaximized: parsed.isMaximized,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readStoredQueue(): QueueItem[] {
   const raw = window.localStorage.getItem(QUEUE_STORAGE_KEY);
   if (!raw) return [];
 
   try {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((value): value is number => Number.isInteger(value) && value > 0);
+    return parsed
+      .map((item) => {
+        if (typeof item === "number") {
+          return {
+            id: `${item}-${Math.random()}-${Date.now()}`,
+            trackId: item,
+          };
+        } else if (item && typeof item === "object" && typeof item.trackId === "number") {
+          return {
+            id: item.id || `${item.trackId}-${Math.random()}-${Date.now()}`,
+            trackId: item.trackId,
+          };
+        }
+        return null;
+      })
+      .filter((item): item is QueueItem => item !== null);
   } catch {
     return [];
   }
@@ -3782,6 +5424,91 @@ function formatImportHint(paths: string[], summary: ImportSummary, target: DropT
 
 function fileNameFromPath(path: string) {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+}
+
+function isLinuxDesktop() {
+  if (typeof navigator === "undefined") return false;
+  return /linux/i.test(navigator.userAgent);
+}
+
+function isWindowsDesktop() {
+  if (typeof navigator === "undefined") return false;
+  return /windows/i.test(navigator.userAgent);
+}
+
+function hasCompletedQuickSetup() {
+  if (typeof window === "undefined") {
+    return true;
+  }
+
+  return window.localStorage.getItem(QUICK_SETUP_STORAGE_KEY) === "done";
+}
+
+function validateMusicFolderPath(path: string) {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (isFilesystemRootPath(trimmed)) {
+    return "choose a music folder, not a whole drive root like C:\\ or D:\\.";
+  }
+
+  return null;
+}
+
+function isFilesystemRootPath(path: string) {
+  if (/^[a-zA-Z]:[\\\/]*$/.test(path)) {
+    return true;
+  }
+
+  const normalized = path.replace(/\\/g, "/");
+  return normalized === "/";
+}
+
+function waitForNextFrame() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
+function findMonitorForWindowState(
+  monitors: Awaited<ReturnType<typeof availableMonitors>>,
+  state: StoredWindowState,
+) {
+  const centerX = state.x + state.width / 2;
+  const centerY = state.y + state.height / 2;
+  return (
+    monitors.find((monitor) => {
+      const { position, workArea } = monitor;
+      const minX = workArea.position.x ?? position.x;
+      const minY = workArea.position.y ?? position.y;
+      const maxX = minX + workArea.size.width;
+      const maxY = minY + workArea.size.height;
+      return centerX >= minX && centerX <= maxX && centerY >= minY && centerY <= maxY;
+    }) ?? null
+  );
+}
+
+function clampWindowStateToMonitor(
+  state: StoredWindowState,
+  monitor: NonNullable<Awaited<ReturnType<typeof primaryMonitor>>>,
+) {
+  const area = monitor.workArea;
+  const width = Math.min(state.width, area.size.width);
+  const height = Math.min(state.height, area.size.height);
+  const minX = area.position.x;
+  const minY = area.position.y;
+  const maxX = area.position.x + area.size.width - width;
+  const maxY = area.position.y + area.size.height - height;
+
+  return {
+    ...state,
+    width,
+    height,
+    x: Math.min(Math.max(state.x, minX), Math.max(minX, maxX)),
+    y: Math.min(Math.max(state.y, minY), Math.max(minY, maxY)),
+  };
 }
 
 function looksLikeAudioPath(path: string) {

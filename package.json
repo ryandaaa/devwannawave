@@ -1,6 +1,6 @@
 {
   "name": "devwannawave",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "a quiet, local-first audio player for developers",
   "private": true,
   "type": "module",
@@ -14,6 +14,7 @@
   "dependencies": {
     "@fontsource-variable/geist-mono": "^5.1.0",
     "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-dialog": "^2.0.0",
     "material-symbols": "^0.27.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

@@ -1,6 +1,6 @@
 [package]
 name = "devwannawave"
-version = "1.0.0"
+version = "1.1.0"
 description = "a quiet, local-first audio player for developers"
 authors = ["devwannawave"]
 edition = "2021"
@@ -21,6 +21,9 @@ lofty = "0.24.0"
 rodio = "0.22.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-global-shortcut = "2"
 thiserror = "2"
 walkdir = "2"

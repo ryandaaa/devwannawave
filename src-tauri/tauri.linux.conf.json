@@ -1,0 +1,18 @@
+{
+  "bundle": {
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/bin/dww": "scripts/linux/dww"
+        },
+        "postInstallScript": "scripts/linux/postinstall.sh"
+      },
+      "rpm": {
+        "files": {
+          "/usr/bin/dww": "scripts/linux/dww"
+        },
+        "postInstallScript": "scripts/linux/postinstall.sh"
+      }
+    }
+  }
+}
